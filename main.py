@@ -49,9 +49,9 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 async def ensure_columns():
     async with engine.begin() as conn:
         # Check if columns exist in 'slots' table
-        # SQLite pragma table_info returns list of tuples
-        # (cid, name, type, notnull, dflt_value, pk)
-        columns = await conn.run_sync(lambda sync_conn: sync_conn.execute(text("PRAGMA table_info(slots)")).fetchall())
+        columns = await conn.run_sync(
+            lambda sync_conn: sync_conn.execute(text("PRAGMA table_info(slots)")).fetchall()
+        )
         col_names = [c[1] for c in columns]
 
         if "capacity" not in col_names:
@@ -60,8 +60,21 @@ async def ensure_columns():
         if "booked_count" not in col_names:
             await conn.execute(text("ALTER TABLE slots ADD COLUMN booked_count INTEGER DEFAULT 0"))
 
-        # Check bookings table existence is handled by create_all, no need to ensure columns per se
-        # But if we need to migrate easy, let's assume create_all handles new tables fine.
+        # Check if columns exist in 'bookings' table
+        booking_columns = await conn.run_sync(
+            lambda sync_conn: sync_conn.execute(text("PRAGMA table_info(bookings)")).fetchall()
+        )
+        booking_col_names = [c[1] for c in booking_columns]
+
+        if "reminder_morning_sent" not in booking_col_names:
+            await conn.execute(
+                text("ALTER TABLE bookings ADD COLUMN reminder_morning_sent BOOLEAN DEFAULT 0")
+            )
+
+        if "reminder_day_sent" not in booking_col_names:
+            await conn.execute(
+                text("ALTER TABLE bookings ADD COLUMN reminder_day_sent BOOLEAN DEFAULT 0")
+            )
 
 async def init_db():
     async with engine.begin() as conn:
@@ -133,6 +146,85 @@ async def safe_edit_text(message: Message, text: str, reply_markup=None) -> bool
             return False
         raise
     
+
+async def reminder_worker(bot: Bot):
+    while True:
+        try:
+            now = datetime.now()
+
+            async with SessionLocal() as session:
+                q = (
+                    select(Booking)
+                    .join(Slot, Booking.slot_id == Slot.id)
+                    .options(joinedload(Booking.slot), joinedload(Booking.user))
+                    .where(
+                        Booking.status == "active",
+                        Slot.start_time > now
+                    )
+                )
+
+                bookings = (await session.execute(q)).scalars().unique().all()
+
+                changed = False
+
+                for b in bookings:
+                    if not b.user or not b.slot:
+                        continue
+
+                    slot_time = b.slot.start_time
+                    time_to_training = slot_time - now
+
+                    # 1. Утреннее напоминание:
+                    # если тренировка сегодня, время уже после 08:00,
+                    # напоминание ещё не отправлялось, и тренировка ещё впереди
+                    if (
+                        not b.reminder_morning_sent
+                        and slot_time.date() == now.date()
+                        and now.hour >= 8
+                    ):
+                        try:
+                            await bot.send_message(
+                                b.user.telegram_id,
+                                f"☀️ Нагадування про тренування сьогодні\n"
+                                f"📍 {b.location}\n"
+                                f"🕒 {fmt_dt(slot_time)}"
+                            )
+                            b.reminder_morning_sent = True
+                            changed = True
+                            logging.info(f"Morning reminder sent for booking_id={b.id}")
+                        except Exception as e:
+                            logging.exception(
+                                f"Failed to send morning reminder for booking_id={b.id}: {e}"
+                            )
+
+                    # 2. Дневное напоминание за 3 часа
+                    if (
+                        not b.reminder_day_sent
+                        and timedelta(hours=0) < time_to_training <= timedelta(hours=3)
+                    ):
+                        try:
+                            await bot.send_message(
+                                b.user.telegram_id,
+                                f"🔔 Нагадування: тренування вже скоро\n"
+                                f"📍 {b.location}\n"
+                                f"🕒 {fmt_dt(slot_time)}\n"
+                                f"Побачимось 💪"
+                            )
+                            b.reminder_day_sent = True
+                            changed = True
+                            logging.info(f"Day reminder sent for booking_id={b.id}")
+                        except Exception as e:
+                            logging.exception(
+                                f"Failed to send day reminder for booking_id={b.id}: {e}"
+                            )
+
+                if changed:
+                    await session.commit()
+
+        except Exception as e:
+            logging.exception(f"Reminder worker error: {e}")
+
+        await asyncio.sleep(60)
    
 
 
@@ -1735,6 +1827,8 @@ async def main():
         if fixed_count > 0:
             logging.info(f"Fixed {fixed_count} legacy bookings with incorrect user_id linkage.")
 
+    asyncio.create_task(reminder_worker(bot))
+    
     await dp.start_polling(bot)
 
 

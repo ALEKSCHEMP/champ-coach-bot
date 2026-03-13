@@ -52,6 +52,9 @@ class Booking(Base):
     status: Mapped[str] = mapped_column(String, default="active") # active, canceled
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    reminder_morning_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    reminder_day_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="bookings")
     slot: Mapped["Slot"] = relationship("Slot", back_populates="bookings")
