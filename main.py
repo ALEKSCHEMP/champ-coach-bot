@@ -111,6 +111,28 @@ async def init_db():
 bot: Bot | None = None
 dp = Dispatcher()
 
+
+async def send_locations(target: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🏋️ Ocean",
+            url="https://maps.app.goo.gl/tZCzeyj1gc8VsQJfA"
+        )],
+        [InlineKeyboardButton(
+            text="🏋️ Center",
+            url="https://maps.app.goo.gl/ubDhumBctmuUveA48"
+        )]
+    ])
+
+    await target.answer(
+        "📍 Локації тренувань\n\n"
+        "🏋️ Ocean\n"
+        "🏋️ Center\n\n"
+        "Оберіть зал 👇",
+        reply_markup=kb
+    )
+
+
 from aiogram.types import ErrorEvent
 
 @dp.errors()
@@ -421,9 +443,8 @@ def build_admin_confirm_kb() -> InlineKeyboardMarkup:
 def build_main_kb(is_admin_user: bool) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="📅 Записатися на тренування")],
-        [KeyboardButton(text="📌 Мій запис")],
+        [KeyboardButton(text="👤 Профіль")],
         [KeyboardButton(text="ℹ️ Контакти тренера")],
-        [KeyboardButton(text="📍 Локації тренувань")],
     ]
 
     if is_admin_user:
@@ -575,7 +596,27 @@ def build_admin_bookings_days_kb() -> InlineKeyboardMarkup:
 async def my_bookings(message: Message):
     await message.answer("Обери що показати 👇", reply_markup=build_my_bookings_mode_kb())
 
+@dp.message(F.text == "👤 Профіль")
+async def profile_handler(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📌 Мої записи", callback_data="profile_my_bookings")],
+        [InlineKeyboardButton(text="📍 Локації тренувань", callback_data="profile_locations")]
+    ])
 
+    await message.answer(
+        "👤 Ваш профіль\n\n"
+        "Оберіть розділ 👇",
+        reply_markup=kb
+    )
+
+
+@dp.callback_query(F.data == "profile_my_bookings")
+async def profile_my_bookings_handler(callback: CallbackQuery):
+    await show_my_bookings(
+        callback.message,
+        tg_user=callback.from_user
+    )
+    await callback.answer()
 
 async def show_my_bookings(
     message: Message,
@@ -663,7 +704,10 @@ async def show_my_bookings(
         await message.answer(text, reply_markup=kb)
         return True, text, kb
 
-
+@dp.callback_query(F.data == "profile_locations")
+async def profile_locations_handler(callback: types.CallbackQuery):
+    await send_locations(callback.message)
+    await callback.answer()
 
 @dp.message(F.text == "ℹ️ Контакти тренера")
 async def coach_contacts_handler(message: Message):
@@ -1204,22 +1248,7 @@ async def admin_bookings_menu(message: Message):
 
 @dp.message(F.text == "📍 Локації тренувань")
 async def locations_handler(message: Message):
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="🏋️ Ocean",
-            url="https://maps.app.goo.gl/tZCzeyj1gc8VsQJfA"
-        )],
-        [InlineKeyboardButton(
-            text="🏋️ Center",
-            url="https://maps.app.goo.gl/ubDhumBctmuUveA48"
-        )]
-    ])
-
-    await message.answer(
-        "📍 Локації тренувань\n\nОберіть зал 👇",
-        reply_markup=kb
-    )
+    await send_locations(message)
     
     
 
