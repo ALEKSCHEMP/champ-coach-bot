@@ -75,7 +75,23 @@ async def ensure_columns():
             await conn.execute(
                 text("ALTER TABLE bookings ADD COLUMN reminder_day_sent BOOLEAN DEFAULT 0")
             )
+        
+        if "reminder_24h_sent" not in booking_col_names:
+            await conn.execute(
+                text("ALTER TABLE bookings ADD COLUMN reminder_24h_sent BOOLEAN DEFAULT 0")
+            )
 
+        if "client_confirmed" not in booking_col_names:
+            await conn.execute(
+                text("ALTER TABLE bookings ADD COLUMN client_confirmed BOOLEAN DEFAULT 0")
+            )
+
+        if "confirmation_status" not in booking_col_names:
+            await conn.execute(
+                text("ALTER TABLE bookings ADD COLUMN confirmation_status VARCHAR DEFAULT 'pending'")
+            )
+            
+            
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -173,6 +189,40 @@ async def reminder_worker(bot: Bot):
 
                     slot_time = b.slot.start_time
                     time_to_training = slot_time - now
+                    
+                     # 0. Напоминание за 24 часа
+                    if (
+                        not b.reminder_24h_sent
+                        and timedelta(hours=23) <= time_to_training <= timedelta(hours=24)
+                    ):
+                        try:
+                            confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+                                [
+                                    InlineKeyboardButton(text="✅ Буду", callback_data=f"confirm_yes:{b.id}"),
+                                    InlineKeyboardButton(text="❌ Не прийду", callback_data=f"confirm_no:{b.id}")
+                                ],
+                                [
+                                    InlineKeyboardButton(text="🔁 Перенести", callback_data=f"reschedule_start:{b.id}")
+                                ]
+                            ])
+
+                            await bot.send_message(
+                                b.user.telegram_id,
+                                f"⏰ Нагадування: тренування завтра\n"
+                                f"📍 {b.location}\n"
+                                f"🕒 {fmt_dt(slot_time)}\n\n"
+                                f"Підтверди, будь ласка, чи будеш 👇",
+                                reply_markup=confirm_kb
+                            )
+
+                            b.reminder_24h_sent = True
+                            changed = True
+                            logging.info(f"24h reminder sent for booking_id={b.id}")
+
+                        except Exception as e:
+                            logging.exception(
+                                f"Failed to send 24h reminder for booking_id={b.id}: {e}"
+                            )
 
                     # 1. Утреннее напоминание:
                     # если тренировка сегодня, время уже после 08:00,
@@ -180,7 +230,7 @@ async def reminder_worker(bot: Bot):
                     if (
                         not b.reminder_morning_sent
                         and slot_time.date() == now.date()
-                        and now.hour >= 8
+                        and 8 <= now.hour < 12
                     ):
                         try:
                             await bot.send_message(
@@ -373,6 +423,7 @@ def build_main_kb(is_admin_user: bool) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📅 Записатися на тренування")],
         [KeyboardButton(text="📌 Мій запис")],
         [KeyboardButton(text="ℹ️ Контакти тренера")],
+        [KeyboardButton(text="📍 Локації тренувань")],
     ]
 
     if is_admin_user:
@@ -614,7 +665,28 @@ async def show_my_bookings(
 
 
 
+@dp.message(F.text == "ℹ️ Контакти тренера")
+async def coach_contacts_handler(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Telegram", url="https://t.me/@alekschemp")],
+        [InlineKeyboardButton(text="📸 Instagram", url="https://www.instagram.com/alekschemp/")],
+        [InlineKeyboardButton(text="📱 Показати номер", callback_data="show_coach_phone")],
+    ])
 
+    text = (
+        "ℹ️ Контакти тренера\n\n"
+        "Оберіть зручний спосіб зв’язку 👇"
+    )
+
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "show_coach_phone")
+async def show_coach_phone(callback: CallbackQuery):
+    await callback.message.answer(
+        "📱 Номер тренера: +380635003137"
+    )
+    await callback.answer()
 
 
 
@@ -1036,14 +1108,64 @@ async def start_booking(message: Message, state: FSMContext):
 
 
 
-@dp.message(F.text == "ℹ️ Контакти тренера")
-async def contacts(message: Message):
-    await message.answer(
-        "Тренер: CHAMP\n"
-        "Звʼязок: Telegram / Instagram\n"
-        "Телефон додамо пізніше 📞"
+
+@dp.callback_query(F.data.startswith("confirm_yes:"))
+async def confirm_yes(callback: types.CallbackQuery):
+    booking_id = int(callback.data.split(":")[1])
+
+    async with SessionLocal() as session:
+        booking = await session.get(Booking, booking_id)
+
+        if not booking:
+            await callback.answer("Запис не знайдено", show_alert=True)
+            return
+
+        if booking.status != "active":
+            await callback.answer("Цей запис вже не активний", show_alert=True)
+            return
+
+        booking.client_confirmed = True
+        booking.confirmation_status = "confirmed"
+
+        await session.commit()
+
+    await callback.message.edit_text(
+        "✅ Супер, запис підтверджено.\n"
+        "Чекаю тебе на тренуванні 💪"
     )
 
+    await callback.answer()
+
+
+
+@dp.callback_query(F.data.startswith("confirm_no:"))
+async def confirm_no(callback: types.CallbackQuery):
+    booking_id = int(callback.data.split(":")[1])
+
+    async with SessionLocal() as session:
+        success, msg = await cancel_booking(
+            session,
+            booking_id,
+            user_telegram_id=callback.from_user.id
+        )
+
+        if success:
+            booking = await session.get(Booking, booking_id)
+            if booking:
+                booking.confirmation_status = "declined"
+                await session.commit()
+
+    if not success:
+        await callback.answer(f"❌ {msg}", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "❌ Запис скасовано.\n"
+        "Якщо захочеш — запишешся знову."
+    )
+
+    await callback.answer("Запис скасовано", show_alert=True)
+    
 
 # Адмін-меню (кнопки)
 admin_kb = ReplyKeyboardMarkup(
@@ -1079,6 +1201,27 @@ async def admin_bookings_menu(message: Message):
         return
     await message.answer("Обери день:", reply_markup=build_admin_bookings_days_kb())
 
+
+@dp.message(F.text == "📍 Локації тренувань")
+async def locations_handler(message: Message):
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🏋️ Ocean",
+            url="https://maps.app.goo.gl/tZCzeyj1gc8VsQJfA"
+        )],
+        [InlineKeyboardButton(
+            text="🏋️ Center",
+            url="https://maps.app.goo.gl/ubDhumBctmuUveA48"
+        )]
+    ])
+
+    await message.answer(
+        "📍 Локації тренувань\n\nОберіть зал 👇",
+        reply_markup=kb
+    )
+    
+    
 
 @dp.callback_query(F.data == "confirm_booking")
 async def confirm_booking(callback: types.CallbackQuery, state: FSMContext):
@@ -1355,7 +1498,12 @@ async def admin_add_pick_capacity(callback: types.CallbackQuery, state: FSMConte
     loc = data.get("add_loc")
     # time_str = data.get("add_time") 
     start_iso = data.get("add_start")
-    start_dt = datetime.fromisoformat(start_iso)
+    if isinstance(start_iso, datetime):
+        start_dt = start_iso
+    elif isinstance(start_iso, str):
+        start_dt = datetime.fromisoformat(start_iso)
+    else:
+        raise TypeError(f"start_iso has invalid type: {type(start_iso).__name__}, value={start_iso!r}")
 
     await state.set_state(AdminAddSlotStates.confirming)
 
