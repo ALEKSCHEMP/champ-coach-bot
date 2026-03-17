@@ -95,11 +95,14 @@ async def create_booking(
             .where(
                 Booking.user_id == user_id,
                 Booking.status == "active",
-                Slot.start_time == slot.start_time
+                and_(
+                    Slot.start_time < slot.end_time,
+                    Slot.end_time > slot.start_time
+                )
             )
         )
         if same_time_booking.scalar_one_or_none():
-            return None, "У вас вже є активний запис на цей час"
+            return None, "У вас вже є інший запис, який перетинається з цим часом"
 
         # 5. Atomic capacity update
         update_stmt = (

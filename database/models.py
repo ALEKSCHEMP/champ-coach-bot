@@ -1,5 +1,5 @@
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import Integer, String, DateTime, ForeignKey, Boolean
+from sqlalchemy import Integer, String, DateTime, ForeignKey, Boolean, UniqueConstraint
 from datetime import datetime
 
 class Base(DeclarativeBase):
@@ -26,6 +26,9 @@ class User(Base):
 
 class Slot(Base):
     __tablename__ = "slots"
+    __table_args__ = (
+        UniqueConstraint("location_code", "start_time", name="uq_slots_location_start"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     location_code: Mapped[str] = mapped_column(String(20))
@@ -62,3 +65,17 @@ class Booking(Base):
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="bookings")
     slot: Mapped["Slot"] = relationship("Slot", back_populates="bookings")
+
+class SlotTemplate(Base):
+    __tablename__ = "slot_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    location_code: Mapped[str] = mapped_column(String(20))
+    weekday: Mapped[int] = mapped_column(Integer) # 0=Mon, 6=Sun
+    window_start: Mapped[str] = mapped_column(String(5)) # HH:MM
+    window_end: Mapped[str] = mapped_column(String(5)) # HH:MM
+    step_minutes: Mapped[int] = mapped_column(Integer, default=30)
+    duration_minutes: Mapped[int] = mapped_column(Integer, default=60)
+    capacity: Mapped[int] = mapped_column(Integer, default=1)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

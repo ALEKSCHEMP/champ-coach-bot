@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import (
     Message,
+    CallbackQuery,
     ReplyKeyboardMarkup,
     KeyboardButton,
     InlineKeyboardMarkup,
@@ -25,12 +26,13 @@ from aiogram.exceptions import TelegramBadRequest
 
 
 
-from sqlalchemy import select, text, or_, and_ 
+from sqlalchemy import select, text, or_, and_, func
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
-from database.models import Base, Location, Slot, Booking, User
+from database.models import Base, Location, Slot, Booking, User, SlotTemplate
 from services.booking_service import create_booking, cancel_booking, get_slots_by_date, get_bookings_for_day, fix_legacy_booking_user_ids
+from services.template_service import get_templates, create_template, delete_template, toggle_template, generate_week_slots
 
 load_dotenv()
 
@@ -59,6 +61,16 @@ async def ensure_columns():
         
         if "booked_count" not in col_names:
             await conn.execute(text("ALTER TABLE slots ADD COLUMN booked_count INTEGER DEFAULT 0"))
+
+        duplicates = await conn.run_sync(
+            lambda sync_conn: sync_conn.execute(
+                text("SELECT location_code, start_time, COUNT(*) FROM slots GROUP BY location_code, start_time HAVING COUNT(*) > 1")
+            ).fetchall()
+        )
+        if duplicates:
+            raise RuntimeError(f"Cannot create unique index 'uq_slots_location_start' because duplicate slots exist: {duplicates}")
+        
+        await conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_slots_location_start ON slots(location_code, start_time)"))
 
         # Check if columns exist in 'bookings' table
         booking_columns = await conn.run_sync(
@@ -111,6 +123,36 @@ async def init_db():
 bot: Bot | None = None
 dp = Dispatcher()
 
+class BookingStates(StatesGroup):
+    choosing_day = State()
+    choosing_location = State()
+    choosing_slot = State()
+    confirming = State()
+
+class AdminAddSlotStates(StatesGroup):
+    choosing_location = State()
+    choosing_day = State()
+    choosing_time = State()
+    choosing_capacity = State()
+    confirming = State()
+
+class AdminAddTemplateStates(StatesGroup):
+    choosing_location = State()
+    choosing_weekday = State()
+    choosing_start = State()
+    choosing_end = State()
+    choosing_step = State()
+    choosing_duration = State()
+    choosing_capacity = State()
+    confirming = State()
+
+class AdminGenerateWeekStates(StatesGroup):
+    choosing_week = State()
+
+class AdminImportWeekStates(StatesGroup):
+    choosing_week = State()
+    confirming = State()
+
 
 async def send_locations(target: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -143,6 +185,287 @@ async def on_errors(event: ErrorEvent):
 
 
 
+@dp.message(F.text == "🗓 Шаблони розкладу")
+async def admin_templates_menu(message: Message):
+    if not is_admin(message):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Створити шаблон", callback_data="adm_tmpl_start")],
+        [InlineKeyboardButton(text="📋 Список шаблонів", callback_data="adm_tmpl_list")],
+        [InlineKeyboardButton(text="📥 Зберегти тиждень як шаблон", callback_data="adm_tmpl_imp_start")],
+    ])
+    await message.answer("🗓 Керування шаблонами розкладу:", reply_markup=kb)
+
+@dp.message(F.text == "⚡ Згенерувати тиждень")
+async def admin_generate_week_menu(message: Message):
+    if not is_admin(message):
+        return
+    await message.answer("Обери тиждень для генерації слотів з активних шаблонів:", reply_markup=build_generate_week_kb())
+    
+# --- Template Management Logic ---
+@dp.callback_query(F.data == "adm_tmpl_start")
+async def adm_tmpl_start(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    await state.set_state(AdminAddTemplateStates.choosing_location)
+    await callback.message.answer("Крок 1/7: Обери локацію", reply_markup=build_admin_locations_kb())
+    await callback.answer()
+
+@dp.callback_query(AdminAddTemplateStates.choosing_location, F.data.startswith("admin_add_loc:"))
+async def adm_tmpl_loc(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    loc_key = callback.data.split(":", 1)[1]
+    loc = LOCATIONS.get(loc_key, loc_key)
+    await state.update_data(tmpl_loc=loc)
+    await state.set_state(AdminAddTemplateStates.choosing_weekday)
+    await callback.message.answer("Крок 2/7: Обери день тижня", reply_markup=build_admin_weekdays_kb())
+    await callback.answer()
+
+@dp.callback_query(AdminAddTemplateStates.choosing_weekday, F.data.startswith("adm_tmpl_wd:"))
+async def adm_tmpl_wd(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    wd = int(callback.data.split(":")[1]) # 0-6
+    await state.update_data(tmpl_wd=wd)
+    await state.set_state(AdminAddTemplateStates.choosing_start)
+    await callback.message.answer("Крок 3/7: Обери час ПОЧАТКУ вікна", reply_markup=build_admin_times_kb())
+    await callback.answer()
+
+@dp.callback_query(AdminAddTemplateStates.choosing_start, F.data.startswith("admin_add_time:"))
+async def adm_tmpl_start_time(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    time_str = callback.data.split(":")[1] + ":" + callback.data.split(":")[2]
+    await state.update_data(tmpl_start=time_str)
+    await state.set_state(AdminAddTemplateStates.choosing_end)
+    await callback.message.answer("Крок 4/7: Обери час КІНЦЯ вікна", reply_markup=build_admin_times_kb())
+    await callback.answer()
+
+@dp.callback_query(AdminAddTemplateStates.choosing_end, F.data.startswith("admin_add_time:"))
+async def adm_tmpl_end_time(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    time_str = callback.data.split(":")[1] + ":" + callback.data.split(":")[2]
+    data = await state.get_data()
+    # Simple validation
+    if time_str <= data.get("tmpl_start"):
+        await callback.message.answer("Час кінця не може бути раніше або рівним початку! Спробуй ще раз.", reply_markup=build_admin_times_kb())
+        await callback.answer()
+        return
+    await state.update_data(tmpl_end=time_str)
+    await state.set_state(AdminAddTemplateStates.choosing_step)
+    await callback.message.answer("Крок 5/7: Крок початку слотів (інтервал)", reply_markup=build_admin_tmpl_step_kb())
+    await callback.answer()
+
+@dp.callback_query(AdminAddTemplateStates.choosing_step, F.data.startswith("adm_tmpl_step:"))
+async def adm_tmpl_step(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    step = int(callback.data.split(":")[1])
+    await state.update_data(tmpl_step=step)
+    await state.set_state(AdminAddTemplateStates.choosing_duration)
+    await callback.message.answer("Крок 6/7: Тривалість одного тренування", reply_markup=build_admin_tmpl_duration_kb())
+    await callback.answer()
+
+@dp.callback_query(AdminAddTemplateStates.choosing_duration, F.data.startswith("adm_tmpl_dur:"))
+async def adm_tmpl_dur(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    dur = int(callback.data.split(":")[1])
+    await state.update_data(tmpl_dur=dur)
+    await state.set_state(AdminAddTemplateStates.choosing_capacity)
+    await callback.message.answer("Крок 7/7: Місткість слота (скільки людей)", reply_markup=build_admin_capacity_kb())
+    await callback.answer()
+
+@dp.callback_query(AdminAddTemplateStates.choosing_capacity, F.data.startswith("admin_add_cap:"))
+async def adm_tmpl_cap(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    cap = int(callback.data.split(":")[1])
+    await state.update_data(tmpl_cap=cap)
+    
+    data = await state.get_data()
+    wd_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+    wd_str = wd_names[data.get("tmpl_wd")]
+    
+    text = (f"Підтвердьте створення шаблону:\n\n"
+            f"📍 Локація: {data.get('tmpl_loc')}\n"
+            f"📅 День: {wd_str}\n"
+            f"⏰ Вікно: {data.get('tmpl_start')} - {data.get('tmpl_end')}\n"
+            f"⏱ Інтервал: {data.get('tmpl_step')} хв\n"
+            f"⏳ Тривалість: {data.get('tmpl_dur')} хв\n"
+            f"👥 Місткість: {cap} осіб")
+            
+    await state.set_state(AdminAddTemplateStates.confirming)
+    await callback.message.answer(text, reply_markup=build_admin_tmpl_confirm_kb())
+    await callback.answer()
+
+@dp.callback_query(AdminAddTemplateStates.confirming, F.data == "adm_tmpl_confirm")
+async def adm_tmpl_commit(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    data = await state.get_data()
+    try:
+        async with SessionLocal() as session:
+            await create_template(
+                session,
+                location_code=data.get('tmpl_loc'),
+                weekday=data.get('tmpl_wd'),
+                window_start=data.get('tmpl_start'),
+                window_end=data.get('tmpl_end'),
+                step_minutes=data.get('tmpl_step'),
+                duration_minutes=data.get('tmpl_dur'),
+                capacity=data.get('tmpl_cap')
+            )
+        await callback.message.answer("✅ Шаблон успішно створено!")
+    except Exception as e:
+        await callback.message.answer(f"❌ Помилка БД: {e}")
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(F.data == "adm_tmpl_list")
+async def adm_tmpl_list(callback: types.CallbackQuery):
+    if not is_admin_user(callback.from_user): return
+    wd_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+    async with SessionLocal() as session:
+        templates = await get_templates(session)
+        
+    if not templates:
+        await callback.message.answer("Шаблонів поки немає.")
+        await callback.answer()
+        return
+        
+    for t in templates:
+        status_icon = "🟢" if t.is_active else "🔴"
+        text = (f"ID: {t.id} | {t.location_code} | {wd_names[t.weekday]}\n"
+                f"⏰ {t.window_start}-{t.window_end} | Крок {t.step_minutes} | Трив {t.duration_minutes} | Міст {t.capacity} | {status_icon}")
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Вимк/Увімк", callback_data=f"adm_tmpl_tg:{t.id}"),
+             InlineKeyboardButton(text="🗑 Видалити", callback_data=f"adm_tmpl_del:{t.id}")]
+        ])
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("adm_tmpl_tg:"))
+async def adm_tmpl_toggle(callback: types.CallbackQuery):
+    if not is_admin_user(callback.from_user): return
+    tid = int(callback.data.split(":")[1])
+    async with SessionLocal() as session:
+        success = await toggle_template(session, tid)
+    if success:
+        await callback.message.answer(f"✅ Статус шаблону {tid} змінено")
+    else:
+        await callback.message.answer("❌ Шаблон не знайдено")
+    await callback.answer()
+    
+@dp.callback_query(F.data.startswith("adm_tmpl_del:"))
+async def adm_tmpl_del(callback: types.CallbackQuery):
+    if not is_admin_user(callback.from_user): return
+    tid = int(callback.data.split(":")[1])
+    async with SessionLocal() as session:
+        success = await delete_template(session, tid)
+    if success:
+        await callback.message.answer(f"🗑 Шаблон {tid} видалено")
+    else:
+        await callback.message.answer("❌ Шаблон не знайдено")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("adm_gen_week:"))
+async def adm_gen_week_post(callback: types.CallbackQuery):
+    if not is_admin_user(callback.from_user): return
+    offset_weeks = int(callback.data.split(":")[1])
+    target_date = date.today() + timedelta(weeks=offset_weeks)
+    
+    await callback.message.answer(f"⏳ Генерую тиждень для дати {target_date.isoformat()}...")
+    try:
+        async with SessionLocal() as session:
+            created, skipped = await generate_week_slots(session, target_date)
+        await callback.message.answer(f"✅ Тиждень успішно згенеровано!\n\nСтворено слотів: {created}\nПропущено (вже існують): {skipped}")
+    except Exception as e:
+        await callback.message.answer(f"❌ Помилка під час генерації: {e}")
+        logging.exception(e)
+    await callback.answer()
+
+@dp.callback_query(F.data == "adm_tmpl_imp_start")
+async def adm_tmpl_imp_start(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    await state.set_state(AdminImportWeekStates.choosing_week)
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Цей тиждень", callback_data="adm_tmpl_imp_week:0")],
+        [InlineKeyboardButton(text="Наступний тиждень", callback_data="adm_tmpl_imp_week:1")],
+        [InlineKeyboardButton(text="Через 2 тижні", callback_data="adm_tmpl_imp_week:2")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_add_cancel")]
+    ])
+    await callback.message.answer("Обери тиждень, слоти якого потрібно перетворити на шаблони:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(AdminImportWeekStates.choosing_week, F.data.startswith("adm_tmpl_imp_week:"))
+async def adm_tmpl_imp_calc(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    offset_weeks = int(callback.data.split(":")[1])
+    target_date = date.today() + timedelta(weeks=offset_weeks)
+    
+    await callback.message.answer("⏳ Аналізую слоти...")
+    
+    from services.template_service import calculate_templates_from_week
+    
+    async with SessionLocal() as session:
+        templates = await calculate_templates_from_week(session, target_date)
+        
+    if not templates:
+        await callback.message.answer("❌ У вибраному тижні немає слотів. Шаблони не створено.")
+        await state.clear()
+        await callback.answer()
+        return
+        
+    wd_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+    lines = ["<b>Знайдені шаблони:</b>"]
+    
+    # We need to serialize them to state to avoid refetching or recalculating if needed, but FSM state has limits
+    # A list of dicts is safe enough
+    serialized = []
+    for t in templates:
+        lines.append(f"• {t.location_code} | {wd_names[t.weekday]} | {t.window_start}-{t.window_end} | Крок {t.step_minutes} | Трив {t.duration_minutes} | Міст {t.capacity}")
+        serialized.append({
+            "loc": t.location_code, "wd": t.weekday, "w_start": t.window_start, "w_end": t.window_end, 
+            "step": t.step_minutes, "dur": t.duration_minutes, "cap": t.capacity
+        })
+        
+    lines.append("\nЩо робити зі знайденими шаблонами?")
+    await state.update_data(import_tmpls=serialized)
+    await state.set_state(AdminImportWeekStates.confirming)
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Додати до існуючих", callback_data="adm_tmpl_imp_commit:add")],
+        [InlineKeyboardButton(text="♻️ Замінити (перекрити)", callback_data="adm_tmpl_imp_commit:replace")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_add_cancel")]
+    ])
+    
+    await callback.message.answer("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(AdminImportWeekStates.confirming, F.data.startswith("adm_tmpl_imp_commit:"))
+async def adm_tmpl_imp_commit(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    mode = callback.data.split(":")[1]
+    replace = (mode == "replace")
+    
+    data = await state.get_data()
+    raw = data.get("import_tmpls", [])
+    
+    from database.models import SlotTemplate
+    from services.template_service import save_imported_templates
+    
+    tmpls = [SlotTemplate(
+        location_code=r["loc"], weekday=r["wd"], window_start=r["w_start"], window_end=r["w_end"],
+        step_minutes=r["step"], duration_minutes=r["dur"], capacity=r["cap"], is_active=True
+    ) for r in raw]
+    
+    try:
+        async with SessionLocal() as session:
+            saved_count = await save_imported_templates(session, tmpls, replace_mode=replace)
+        await callback.message.answer(f"✅ Успішно збережено шаблонів: {saved_count}")
+    except Exception as e:
+        await callback.message.answer(f"❌ Помилка БД: {e}")
+        logging.exception(e)
+        
+    await state.clear()
+    await callback.answer()
+
 def is_admin(message: Message) -> bool:
     return (
         ADMIN_ID != 0
@@ -160,20 +483,6 @@ LOCATIONS = {
     "ОКЕАН": "Океан",
     "ЦЕНТР": "Центр"
 }
-
-
-
-class BookingStates(StatesGroup):
-    choosing_day = State()
-    choosing_location = State()
-    choosing_slot = State()
-    confirming = State()
-class AdminAddSlotStates(StatesGroup):
-    choosing_location = State()
-    choosing_day = State()
-    choosing_time = State()
-    choosing_capacity = State()
-    confirming = State()
     
 async def safe_edit_text(message: Message, text: str, reply_markup=None) -> bool:
     try:
@@ -381,16 +690,56 @@ def build_admin_locations_kb() -> InlineKeyboardMarkup:
 
 
 
-def build_admin_days_kb() -> InlineKeyboardMarkup:
+def build_admin_days_kb(page: int = 0) -> InlineKeyboardMarkup:
     today = date.today()
+
+    start_index = page * ADMIN_DAYS_PAGE_SIZE
+    end_index = min(start_index + ADMIN_DAYS_PAGE_SIZE, ADMIN_DAYS_TOTAL)
+
     rows = []
-    for i in range(7):
+
+    for i in range(start_index, end_index):
         d = today + timedelta(days=i)
-        label = d.strftime("%a %d.%m")  # Mon 12.01
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"admin_add_day:{d.isoformat()}")])
+
+        if i == 0:
+            label = f"📅 Сьогодні • {d.strftime('%d.%m')}"
+        elif i == 1:
+            label = f"➡️ Завтра • {d.strftime('%d.%m')}"
+        else:
+            label = f"{d.strftime('%a')} • {d.strftime('%d.%m')}"
+
+        rows.append([
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"admin_add_day:{d.isoformat()}"
+            )
+        ])
+
+    # --- навигация ---
+    nav = []
+
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=f"admin_daypage:{page-1}"
+            )
+        )
+
+    if end_index < ADMIN_DAYS_TOTAL:
+        nav.append(
+            InlineKeyboardButton(
+                text="➡️ Далі",
+                callback_data=f"admin_daypage:{page+1}"
+            )
+        )
+
+    if nav:
+        rows.append(nav)
 
     rows.append([InlineKeyboardButton(text="↩️ Назад", callback_data="admin_add_back_loc")])
     rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_add_cancel")])
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def build_admin_slots_days_kb() -> InlineKeyboardMarkup:
@@ -407,9 +756,19 @@ def build_admin_slots_days_kb() -> InlineKeyboardMarkup:
 
 def build_admin_times_kb() -> InlineKeyboardMarkup:
     rows = []
-    for hour in range(8, 22):  # 08:00..21:00
-        t = f"{hour:02d}:00"
-        rows.append([InlineKeyboardButton(text=t, callback_data=f"admin_add_time:{t}")])
+    times = []
+    for hour in range(8, 22):  # 08:00..21:30
+        times.append(f"{hour:02d}:00")
+        times.append(f"{hour:02d}:30")
+
+    row = []
+    for t in times:
+        row.append(InlineKeyboardButton(text=t, callback_data=f"admin_add_time:{t}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
 
     rows.append([InlineKeyboardButton(text="↩️ Назад", callback_data="admin_add_back_day")])
     rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_add_cancel")])
@@ -435,6 +794,43 @@ def build_admin_confirm_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="✅ Додати слот", callback_data="admin_add_confirm")],
         [InlineKeyboardButton(text="↩️ Назад", callback_data="admin_add_back_time")],
         [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_add_cancel")],
+    ])
+
+# --- Template Admin Keyboards ---
+
+def build_admin_weekdays_kb() -> InlineKeyboardMarkup:
+    days = ["Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота", "Неділя"]
+    rows = []
+    for i, d in enumerate(days):
+        rows.append([InlineKeyboardButton(text=d, callback_data=f"adm_tmpl_wd:{i}")])
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_add_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def build_admin_tmpl_step_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="30 хв", callback_data="adm_tmpl_step:30"),
+         InlineKeyboardButton(text="60 хв", callback_data="adm_tmpl_step:60")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_add_cancel")]
+    ])
+
+def build_admin_tmpl_duration_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="60 хв", callback_data="adm_tmpl_dur:60"),
+         InlineKeyboardButton(text="90 хв", callback_data="adm_tmpl_dur:90")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_add_cancel")]
+    ])
+
+def build_admin_tmpl_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Створити шаблон", callback_data="adm_tmpl_confirm")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_add_cancel")]
+    ])
+
+def build_generate_week_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Цей тиждень", callback_data="adm_gen_week:0")],
+        [InlineKeyboardButton(text="Наступний тиждень", callback_data="adm_gen_week:1")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_add_cancel")]
     ])
 
 
@@ -541,6 +937,8 @@ def build_my_bookings_kb(bookings: list[Booking], mode: str = "active") -> Inlin
 CLIENT_DAYS_TOTAL = 14          # скільки днів показувати всього
 CLIENT_DAYS_PAGE_SIZE = 7       # скільки кнопок на сторінці
 
+ADMIN_DAYS_TOTAL = 60        # сколько дней вперед доступно админу
+ADMIN_DAYS_PAGE_SIZE = 7     # сколько кнопок на странице
 
 def build_client_days_kb(page: int = 0) -> InlineKeyboardMarkup:
     today = date.today()
@@ -819,6 +1217,25 @@ async def admin_slots_show_day(callback: types.CallbackQuery):
 
 
 
+@dp.callback_query(F.data.startswith("admin_daypage:"))
+async def admin_days_page(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
+        return
+
+    page = int(callback.data.split(":")[1])
+
+    await state.set_state(AdminAddSlotStates.choosing_day)
+
+    await callback.message.answer(
+        "Обери день:",
+        reply_markup=build_admin_days_kb(page=page)
+    )
+
+    await callback.answer()
+    
+    
+    
 @dp.callback_query(F.data.startswith("admin_edit_cap_start:"))
 async def admin_edit_cap_start(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -1214,8 +1631,8 @@ async def confirm_no(callback: types.CallbackQuery):
 # Адмін-меню (кнопки)
 admin_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="➕ Додати слот")],
-        [KeyboardButton(text="📅 Слоти")],
+        [KeyboardButton(text="➕ Додати слот"), KeyboardButton(text="📅 Слоти")],
+        [KeyboardButton(text="🗓 Шаблони розкладу"), KeyboardButton(text="⚡ Згенерувати тиждень")],
         [KeyboardButton(text="📅 Записи на день")], 
         [KeyboardButton(text="🔙 Головне меню")],
     ],
@@ -1690,14 +2107,25 @@ async def admin_slot_delete(callback: types.CallbackQuery):
     slot_id = int(slot_id_str)
 
     async with SessionLocal() as session:
-        slot = (await session.execute(select(Slot).where(Slot.id == slot_id))).scalar_one_or_none()
+        slot = (await session.execute(
+            select(Slot).where(Slot.id == slot_id)
+        )).scalar_one_or_none()
+
         if slot is None:
             await callback.message.answer("Слот не знайдено.")
             await callback.answer()
             return
 
-        if slot.booked_count > 0:
-            await callback.message.answer(f"Цей слот має {slot.booked_count} активних записів. Спочатку скасуйте їх.")
+        # Проверяем любые бронирования по этому слоту: и active, и canceled
+        bookings_count = await session.scalar(
+            select(func.count()).select_from(Booking).where(Booking.slot_id == slot_id)
+        )
+
+        if bookings_count and bookings_count > 0:
+            await callback.message.answer(
+                f"❌ Слот не можна видалити, бо з ним пов'язано {bookings_count} бронювань "
+                f"(включно з історією/скасованими)."
+            )
             await callback.answer()
             return
 
@@ -1705,14 +2133,6 @@ async def admin_slot_delete(callback: types.CallbackQuery):
         await session.commit()
 
     await callback.message.answer(f"🗑 Видалено слот id:{slot_id}")
-    # Показати оновлений список
-    await admin_slots_show_day(types.CallbackQuery(
-        id=callback.id,
-        from_user=callback.from_user,
-        chat_instance=callback.chat_instance,
-        message=callback.message,
-        data=f"admin_slots_day:{target_day_iso}"
-    ))
     await callback.answer()
 
 
