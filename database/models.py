@@ -58,9 +58,14 @@ class Booking(Base):
     reminder_24h_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     reminder_morning_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     reminder_day_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    post_workout_offer_sent: Mapped[bool] = mapped_column(Boolean, default=False)
 
     client_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
     confirmation_status: Mapped[str] = mapped_column(String, default="pending")
+    
+    people_count: Mapped[int] = mapped_column(Integer, default=1)
+    
+    calendar_event_id: Mapped[str | None] = mapped_column(String, nullable=True)
    
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="bookings")
@@ -68,7 +73,7 @@ class Booking(Base):
 
 class SlotTemplate(Base):
     __tablename__ = "slot_templates"
-
+    
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     location_code: Mapped[str] = mapped_column(String(20))
     weekday: Mapped[int] = mapped_column(Integer) # 0=Mon, 6=Sun

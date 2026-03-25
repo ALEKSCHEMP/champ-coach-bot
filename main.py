@@ -4,9 +4,6 @@ import os
 from datetime import datetime, timedelta, date
 
 
-
-
-
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, types
@@ -31,8 +28,9 @@ from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from database.models import Base, Location, Slot, Booking, User, SlotTemplate
-from services.booking_service import create_booking, cancel_booking, get_slots_by_date, get_bookings_for_day, fix_legacy_booking_user_ids
+from services.booking_service import create_booking, cancel_booking, get_bookings_for_day, fix_legacy_booking_user_ids
 from services.template_service import get_templates, create_template, delete_template, toggle_template, generate_week_slots
+from services.google_calendar import create_event
 
 load_dotenv()
 
@@ -102,7 +100,21 @@ async def ensure_columns():
             await conn.execute(
                 text("ALTER TABLE bookings ADD COLUMN confirmation_status VARCHAR DEFAULT 'pending'")
             )
-            
+        
+        if "calendar_event_id" not in booking_col_names:
+            await conn.execute(
+                text("ALTER TABLE bookings ADD COLUMN calendar_event_id VARCHAR")
+            )    
+
+        if "post_workout_offer_sent" not in booking_col_names:
+            await conn.execute(
+                text("ALTER TABLE bookings ADD COLUMN post_workout_offer_sent BOOLEAN DEFAULT 0")
+            )
+        
+        if "people_count" not in booking_col_names:
+            await conn.execute(
+                text("ALTER TABLE bookings ADD COLUMN people_count INTEGER DEFAULT 1")
+            )    
             
 async def init_db():
     async with engine.begin() as conn:
@@ -127,6 +139,7 @@ class BookingStates(StatesGroup):
     choosing_day = State()
     choosing_location = State()
     choosing_slot = State()
+    choosing_people_count = State()
     confirming = State()
 
 class AdminAddSlotStates(StatesGroup):
@@ -146,8 +159,6 @@ class AdminAddTemplateStates(StatesGroup):
     choosing_capacity = State()
     confirming = State()
 
-class AdminGenerateWeekStates(StatesGroup):
-    choosing_week = State()
 
 class AdminImportWeekStates(StatesGroup):
     choosing_week = State()
@@ -182,19 +193,6 @@ async def on_errors(event: ErrorEvent):
     logging.exception(f"Unhandled error: {event.exception}")
     return True
 
-
-
-
-@dp.message(F.text == "🗓 Шаблони розкладу")
-async def admin_templates_menu(message: Message):
-    if not is_admin(message):
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Створити шаблон", callback_data="adm_tmpl_start")],
-        [InlineKeyboardButton(text="📋 Список шаблонів", callback_data="adm_tmpl_list")],
-        [InlineKeyboardButton(text="📥 Зберегти тиждень як шаблон", callback_data="adm_tmpl_imp_start")],
-    ])
-    await message.answer("🗓 Керування шаблонами розкладу:", reply_markup=kb)
 
 @dp.message(F.text == "⚡ Згенерувати тиждень")
 async def admin_generate_week_menu(message: Message):
@@ -506,7 +504,7 @@ async def reminder_worker(bot: Bot):
                     .options(joinedload(Booking.slot), joinedload(Booking.user))
                     .where(
                         Booking.status == "active",
-                        Slot.start_time > now
+                        Slot.start_time > now - timedelta(days=1)
                     )
                 )
 
@@ -599,6 +597,27 @@ async def reminder_worker(bot: Bot):
                                 f"Failed to send day reminder for booking_id={b.id}: {e}"
                             )
 
+                    # 3. Post-workout offer
+                    if (
+                        not getattr(b, "post_workout_offer_sent", False)
+                        and b.status == "active"
+                        and b.slot
+                        and b.slot.start_time < now - timedelta(minutes=90)
+                    ):
+                        try:
+                            await bot.send_message(
+                                b.user.telegram_id,
+                                POST_WORKOUT_TEXT,
+                                reply_markup=post_workout_rebook_kb(b.id)
+                            )
+                            b.post_workout_offer_sent = True
+                            changed = True
+                            logging.info(f"Post-workout offer sent for booking_id={b.id}")
+                        except Exception as e:
+                            logging.exception(
+                                f"Failed to send post-workout offer for booking_id={b.id}: {e}"
+                            )
+
                 if changed:
                     await session.commit()
 
@@ -661,15 +680,6 @@ async def build_free_slots_kb(target_day: date, location_filter: str | None) -> 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-
-
-def build_day_choice_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Сьогодні", callback_data="day:today")],
-        [InlineKeyboardButton(text="➡️ Завтра", callback_data="day:tomorrow")],
-        [InlineKeyboardButton(text="📍 Субота", callback_data="day:sat")],
-        [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_booking")],
-    ])
 
 def build_my_bookings_mode_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -990,9 +1000,6 @@ def build_admin_bookings_days_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-@dp.message(F.text == "📌 Мій запис")
-async def my_bookings(message: Message):
-    await message.answer("Обери що показати 👇", reply_markup=build_my_bookings_mode_kb())
 
 @dp.message(F.text == "👤 Профіль")
 async def profile_handler(message: Message):
@@ -1084,13 +1091,15 @@ async def show_my_bookings(
         lines = ["📌 Твої активні записи (майбутні):\n"]
         for i, b in enumerate(bookings, start=1):
             dt = b.slot.start_time
-            lines.append(f"{i}) 📍 {b.location} • 🕒 {fmt_dt(dt)}")
+            ppl = f" • 👥 {b.people_count}" if getattr(b, "people_count", 1) > 1 else ""
+            lines.append(f"{i}) 📍 {b.location} • 🕒 {fmt_dt(dt)}{ppl}")
     else:
         lines = ["📜 Історія записів:\n"]
         for i, b in enumerate(bookings, start=1):
             dt = b.slot.start_time
             status = "❌ скасовано" if b.status != "active" else "✅ було"
-            lines.append(f"{i}) 📍 {b.location} • 🕒 {fmt_dt(dt)} • {status}")
+            ppl = f" • 👥 {b.people_count}" if getattr(b, "people_count", 1) > 1 else ""
+            lines.append(f"{i}) 📍 {b.location} • 🕒 {fmt_dt(dt)}{ppl} • {status}")
 
     text = "\n".join(lines)
     kb = build_my_bookings_kb(bookings, mode=mode)
@@ -1373,13 +1382,151 @@ async def my_cancel(callback: types.CallbackQuery):
 
 
 
+@dp.callback_query(F.data.startswith("rebook_same:"))
+async def rebook_same_handler(callback: types.CallbackQuery):
+    booking_id = int(callback.data.split(":")[1])
 
-@dp.callback_query(F.data == "my_back_menu")
-async def my_back_menu(callback: types.CallbackQuery):
-    await callback.message.answer("Обери дію 👇",reply_markup=build_main_kb(is_admin_user(callback.from_user))
-)
+    async with SessionLocal() as session:
+        q = (
+            select(Booking)
+            .options(joinedload(Booking.slot), joinedload(Booking.user))
+            .where(Booking.id == booking_id)
+        )
+        booking = (await session.execute(q)).scalars().first()
+
+        if not booking:
+            await callback.answer("Запис не знайдено", show_alert=True)
+            return
+
+        if booking.status != "active":
+            await callback.answer("Цей запис уже неактивний", show_alert=True)
+            return
+
+        if not booking.slot or not booking.user:
+            await callback.answer("Не вдалося отримати дані запису", show_alert=True)
+            return
+
+        current_slot = booking.slot
+        next_start = current_slot.start_time + timedelta(days=7)
+
+        q_next_slot = (
+            select(Slot)
+            .where(
+                Slot.location_code == current_slot.location_code,
+                Slot.start_time == next_start
+            )
+        )
+        next_slot = (await session.execute(q_next_slot)).scalars().first()
+
+        if not next_slot:
+            await callback.answer("Такого слота на наступний тиждень немає", show_alert=True)
+            await callback.message.edit_text(
+                "❌ На наступний тиждень такого самого часу поки немає.\n"
+                "Оберіть інший час."
+            )
+            return
+
+        q_existing = (
+            select(Booking)
+            .join(Slot, Booking.slot_id == Slot.id)
+            .where(
+                Booking.user_id == booking.user_id,
+                Booking.status == "active",
+                Slot.start_time == next_slot.start_time
+            )
+        )
+        existing_booking = (await session.execute(q_existing)).scalars().first()
+
+        if existing_booking:
+            await callback.answer("У тебе вже є запис на цей час", show_alert=True)
+            await callback.message.edit_text(
+                "✅ У тебе вже є запис на цей самий час наступного тижня."
+            )
+            return
+
+        people_count = getattr(booking, "people_count", 1)
+
+        if getattr(next_slot, "capacity", 1) - getattr(next_slot, "booked_count", 0) < people_count:
+            await callback.answer("На жаль, місць уже немає", show_alert=True)
+            await callback.message.edit_text(
+                "❌ На жаль, цей слот уже зайнятий або немає достатньо вільних місць.\n"
+                "Оберіть інший час."
+            )
+            return
+
+        new_booking = Booking(
+            user_id=booking.user_id,
+            slot_id=next_slot.id,
+            booking_date=next_slot.start_time.date(),
+            location=next_slot.location_code,
+            status="active",
+            people_count=people_count
+        )
+
+        session.add(new_booking)
+        next_slot.booked_count = getattr(next_slot, "booked_count", 0) + people_count
+
+        await session.commit()
+
+        slot_time_str = next_slot.start_time.strftime("%d.%m о %H:%M")
+
+        await callback.answer("Готово 💪")
+        await callback.message.edit_text(
+            f"✅ Тебе записано на наступне тренування:\n{slot_time_str}"
+        )
+        
+
+@dp.callback_query(F.data.startswith("rebook_other:"))
+async def rebook_other_handler(callback: types.CallbackQuery):
     await callback.answer()
+    await callback.message.edit_text(
+        "📅 Добре, обери інший час через звичайне меню запису."
+    )        
 
+
+POST_WORKOUT_TEXT = (
+    "Тренування завершено 💪\n"
+    "Сьогодні ти добре попрацював(-ла).\n"
+    "Хочеш одразу записатися на наступне?"
+)
+
+def post_workout_rebook_kb(booking_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔁 Так, той самий час",
+                    callback_data=f"rebook_same:{booking_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📅 Обрати інший час",
+                    callback_data=f"rebook_other:{booking_id}"
+                )
+            ]
+        ]
+    )
+
+
+@dp.message(F.text == "/test_rebook")
+async def test_rebook(message: Message):
+    async with SessionLocal() as session:
+        q = (
+            select(Booking)
+            .where(Booking.status == "active")
+            .order_by(Booking.id.desc())
+        )
+        booking = (await session.execute(q)).scalars().first()
+
+        if not booking:
+            await message.answer("Немає активних записів для тесту")
+            return
+
+        await message.answer(
+            POST_WORKOUT_TEXT,
+            reply_markup=post_workout_rebook_kb(booking.id)
+        )
 
 
 
@@ -1409,132 +1556,6 @@ async def admin_panel(message: Message):
         return
 
     await message.answer("Адмін-доступ ✅\nДалі додамо команди для слотів.")
-@dp.message(F.text.startswith("/addslot"))
-async def add_slot(message: Message):
-    if not is_admin(message):
-        await message.answer("Немає доступу.")
-        return
-
-    await message.answer("DEBUG: addslot зайшов у хендлер ✅")
-
-    parts = message.text.strip().split()
-    await message.answer(f"DEBUG parts={parts}")
-
-    if len(parts) != 4:
-        await message.answer("Формат: /addslot океан 2026-01-10 11:00")
-        return
-
-    loc_key = parts[1].upper()
-
-    if loc_key not in LOCATIONS:
-        await message.answer(
-            "Локація має бути: " + " або ".join(LOCATIONS.values())
-        )
-        return
-
-    loc = LOCATIONS[loc_key]
-    await message.answer(f"DEBUG loc={loc}")
-
-    dt_str = f"{parts[2]} {parts[3]}"
-    try:
-        start_time = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
-    except ValueError:
-        await message.answer("Дата/час: 2026-01-10 11:00")
-        return
-
-    await message.answer(f"DEBUG start={fmt_dt(start_time)}")
-
-    end_time = start_time + timedelta(hours=1)
-
-    try:
-        async with SessionLocal() as session:
-            q = select(Slot).where(
-                Slot.location_code == loc,
-                Slot.start_time == start_time
-            )
-            exists = (await session.execute(q)).scalar_one_or_none()
-            if exists:
-                await message.answer("Такий слот вже існує.")
-                return
-
-            session.add(Slot(
-                location_code=loc,
-                start_time=start_time,
-                end_time=end_time,
-                status="free",
-                capacity=1,
-                booked_count=0
-            ))
-            await session.commit()
-
-    except Exception as e:
-        logging.exception("DB ERROR in addslot")
-        await message.answer(f"DB ERROR ❌ {type(e).__name__}: {e}")
-        return
-
-    await message.answer("DEBUG commit ✅ слот записано в БД")
-    await message.answer(f"✅ Додано слот: {loc} • {fmt_dt(start_time)} (Cap: 1)")
-
-
-@dp.message(F.text.startswith("/slots"))
-async def list_slots(message: Message):
-    if not is_admin(message):
-        await message.answer("Немає доступу.")
-        return
-
-    # Формат: /slots 2026-01-08
-    parts = message.text.strip().split()
-    if len(parts) != 2:
-        await message.answer("Формат: /slots 2026-01-08")
-        return
-
-    try:
-        d = datetime.strptime(parts[1], "%Y-%m-%d").date()
-    except ValueError:
-        await message.answer("Дата: 2026-01-08")
-        return
-
-    start = datetime.combine(d, datetime.min.time())
-    end = start + timedelta(days=1)
-
-    async with SessionLocal() as session:
-        q = (
-            select(Slot)
-            .where(Slot.start_time >= start, Slot.start_time < end)
-            .order_by(Slot.location_code, Slot.start_time)
-        )
-        slots = (await session.execute(q)).scalars().all()
-
-    if not slots:
-        await message.answer("Слотів на цей день немає.")
-        return
-
-    # 🔢 ЛІЧИЛЬНИКИ
-    total_capacity = sum(s.capacity for s in slots)
-    total_booked = sum(s.booked_count for s in slots)
-    total_free = total_capacity - total_booked
-
-    # 📝 Формування тексту
-    lines = [
-        f"📅 Слоти на {d}:",
-        f"🧾 Cap: {total_capacity} | Booked: {total_booked} | Free: {total_free}",
-        ""
-    ]
-
-    current_loc = None
-    for s in slots:
-        if current_loc != s.location_code:
-            current_loc = s.location_code
-            lines.append(f"\n📍 Локація {current_loc}")
-
-        # mark = "🟢" if s.status == "free" else "🔴"
-        status_icon = "🟢" if s.booked_count < s.capacity else "🔴"
-        lines.append(f"{status_icon} {fmt_dt(s.start_time)} ({s.booked_count}/{s.capacity}) (id:{s.id})")
-
-    await message.answer("\n".join(lines))
-
-
-
 
 
 
@@ -1632,7 +1653,7 @@ async def confirm_no(callback: types.CallbackQuery):
 admin_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="➕ Додати слот"), KeyboardButton(text="📅 Слоти")],
-        [KeyboardButton(text="🗓 Шаблони розкладу"), KeyboardButton(text="⚡ Згенерувати тиждень")],
+        [KeyboardButton(text="⚡ Згенерувати тиждень")],
         [KeyboardButton(text="📅 Записи на день")], 
         [KeyboardButton(text="🔙 Головне меню")],
     ],
@@ -1667,48 +1688,153 @@ async def admin_bookings_menu(message: Message):
 async def locations_handler(message: Message):
     await send_locations(message)
     
-    
+@dp.message(F.text == "/sync_calendar_future")
+async def sync_calendar_future(message: Message):
+    if not is_admin(message):
+        await message.answer("Немає доступу.")
+        return
+
+    now = datetime.now()
+    created_count = 0
+    skipped_count = 0
+    failed_count = 0
+
+    async with SessionLocal() as session:
+        q = (
+            select(Booking)
+            .join(Slot, Booking.slot_id == Slot.id)
+            .options(joinedload(Booking.slot), joinedload(Booking.user))
+            .where(
+                Booking.status == "active",
+                Slot.start_time >= now
+            )
+            .order_by(Slot.start_time.asc())
+        )
+
+        bookings = (await session.execute(q)).scalars().unique().all()
+
+        for b in bookings:
+            if not b.slot:
+                skipped_count += 1
+                continue
+
+            # Уже синхронизировано
+            if b.calendar_event_id:
+                skipped_count += 1
+                continue
+
+            try:
+                client_name = "Клієнт"
+                tg_username = "—"
+
+                if b.user:
+                    client_name = b.user.full_name or b.user.username or "Клієнт"
+                    tg_username = b.user.username or "—"
+
+                event_id = create_event(
+                    summary=f"🏋️ Тренування — {client_name}",
+                    description=(
+                        f"Клієнт: {client_name}\n"
+                        f"Telegram: @{tg_username}\n"
+                        f"Локація: {b.location}"
+                    ),
+                    start_dt=b.slot.start_time,
+                    end_dt=b.slot.end_time
+                )
+
+                b.calendar_event_id = event_id
+                created_count += 1
+
+            except Exception as e:
+                failed_count += 1
+                logging.exception(f"Failed to sync booking_id={b.id} to calendar: {e}")
+
+        await session.commit()
+
+    await message.answer(
+        "✅ Синхронізацію завершено\n"
+        f"Створено подій: {created_count}\n"
+        f"Пропущено: {skipped_count}\n"
+        f"Помилок: {failed_count}"
+    )   
 
 @dp.callback_query(F.data == "confirm_booking")
 async def confirm_booking(callback: types.CallbackQuery, state: FSMContext):
+    # СРАЗУ закрываем callback, чтобы Telegram не считал его просроченным
+    await callback.answer()
+
     if await state.get_state() != BookingStates.confirming.state:
-        await callback.answer()
         return
 
     data = await state.get_data()
     slot_id = data.get("slot_id")
+    people_count = data.get("people_count", 1)
     if slot_id is None:
         await callback.message.answer("Помилка: не обрано слот.")
         await state.clear()
-        await callback.answer()
         return
 
-    # Use service to create booking
+    # 1. Создаём запись в БД
     async with SessionLocal() as session:
         booking, msg = await create_booking(
-            session, 
+            session,
             telegram_id=callback.from_user.id,
             username=callback.from_user.username,
             full_name=callback.from_user.full_name,
-            slot_id=int(slot_id)
+            slot_id=int(slot_id),
+            people_count=int(people_count)
         )
 
     if not booking:
         await callback.message.answer(f"❌ {msg}")
         await state.clear()
-        await callback.answer()
         return
+    
+    
+    
+    # 2. Пытаемся создать событие в Google Calendar
+    try:
+        slot_time = booking.booking_date
+        end_time = booking.slot.end_time if booking.slot else slot_time + timedelta(hours=1)
 
+        client_name = callback.from_user.full_name or callback.from_user.username or "Клієнт"
+        location_name = booking.location
+
+        event_id = await asyncio.to_thread(
+            create_event,
+            f"🏋️ Тренування — {client_name}",
+            (
+                f"Клієнт: {client_name}\n"
+                f"Telegram: @{callback.from_user.username or '—'}\n"
+                f"Локація: {location_name}"
+            ),
+            slot_time,
+            end_time
+        )
+
+        async with SessionLocal() as session:
+            db_booking = await session.get(Booking, booking.id)
+            if db_booking:
+                db_booking.calendar_event_id = event_id
+                await session.commit()
+
+    except Exception as e:
+        logging.exception(f"Failed to create Google Calendar event: {e}")
+        await callback.message.answer(
+        "⚠️ Запис створено, але подію в Google Calendar не вдалося додати."
+    )
+
+    # 3. Отвечаем пользователю
     user = callback.from_user
-    # booking object has .slot loaded? create_booking says it re-queries with joinedload
     slot_loc = booking.location
     slot_time = booking.booking_date
-    
+
     await callback.message.answer(
         f"✅ Готово\n📍 {slot_loc}\n🕒 {fmt_dt(slot_time)}",
         reply_markup=build_main_kb(is_admin_user(callback.from_user))
     )
 
+    # 4. Сообщение админу
     if ADMIN_ID and ADMIN_ID != 0:
         await bot.send_message(
             ADMIN_ID,
@@ -1720,7 +1846,6 @@ async def confirm_booking(callback: types.CallbackQuery, state: FSMContext):
         )
 
     await state.clear()
-    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("daypage:"))
@@ -1821,9 +1946,51 @@ async def choose_slot(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # Переходимо на підтвердження
-    await state.set_state(BookingStates.confirming)
+    # Переходимо на вибір кількості людей
+    await state.set_state(BookingStates.choosing_people_count)
     await state.update_data(slot_id=slot_id)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 👤", callback_data="people_count:1"),
+         InlineKeyboardButton(text="2 👥", callback_data="people_count:2")],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_slots")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_booking")]
+    ])
+
+    await callback.message.answer(
+        "Скільки людей буде?",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("people_count:"))
+async def choose_people_count(callback: types.CallbackQuery, state: FSMContext):
+    if await state.get_state() != BookingStates.choosing_people_count.state:
+        await callback.answer()
+        return
+
+    people_count = int(callback.data.split(":")[1])
+    
+    data = await state.get_data()
+    slot_id = data.get("slot_id")
+
+    async with SessionLocal() as session:
+        slot = (await session.execute(
+            select(Slot).where(Slot.id == slot_id)
+        )).scalar_one_or_none()
+
+    if not slot:
+        await callback.message.answer("Слот не знайдено.")
+        await callback.answer()
+        return
+
+    if slot.capacity - slot.booked_count < people_count:
+        await callback.message.answer("На жаль, на цей слот немає стільки вільних місць. Обери інший час або кількість людей.")
+        await callback.answer()
+        return
+
+    await state.update_data(people_count=people_count)
+    await state.set_state(BookingStates.confirming)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Підтвердити", callback_data="confirm_booking")],
@@ -1834,7 +2001,8 @@ async def choose_slot(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "Підтвердити запис?\n\n"
         f"📍 {slot.location_code}\n"
-        f"🕒 {fmt_dt(slot.start_time)}",
+        f"🕒 {fmt_dt(slot.start_time)}\n"
+        f"👥 Кількість людей: {people_count}",
         reply_markup=kb
     )
     await callback.answer()
@@ -2339,7 +2507,8 @@ async def admin_bookings_show_day(callback: types.CallbackQuery):
             name = "—"
 
         t = b.slot.start_time.strftime("%H:%M")
-        lines.append(f"🕒 {t} • 👤 {name}")
+        ppl = f" [👥 {b.people_count}]" if getattr(b, "people_count", 1) > 1 else ""
+        lines.append(f"🕒 {t} • 👤 {name}{ppl}")
 
         # кнопка: відкрити анкету/профіль клієнта
         # Callback: admin_client:{booking_id}:{day_iso}
@@ -2398,9 +2567,6 @@ async def my_mode(callback: types.CallbackQuery):
     await callback.answer()
 
     
-    
-
-
 
 
 

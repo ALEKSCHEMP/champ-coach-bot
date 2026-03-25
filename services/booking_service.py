@@ -1,8 +1,10 @@
 from datetime import date, datetime, timedelta
-from sqlalchemy import select, update, and_, desc, asc
+from sqlalchemy import select, update, and_, desc, asc, func
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
 from database.models import Slot, Booking, User
+import asyncio
+from services.google_calendar import delete_event
 
 async def get_slots_by_date(
     session: AsyncSession, 
@@ -61,7 +63,8 @@ async def create_booking(
     slot_id: int = 0,
     telegram_id: int | None = None,
     username: str | None = None,
-    full_name: str | None = None
+    full_name: str | None = None,
+    people_count: int = 1
 ) -> tuple[Booking | None, str]:
     try:
         # 1. Resolve User
@@ -108,15 +111,15 @@ async def create_booking(
         update_stmt = (
             update(Slot)
             .where(Slot.id == slot_id)
-            .where(Slot.booked_count < Slot.capacity)
-            .values(booked_count=Slot.booked_count + 1)
+            .where(Slot.capacity - Slot.booked_count >= people_count)
+            .values(booked_count=Slot.booked_count + people_count)
             .execution_options(synchronize_session="fetch")
         )
 
         result = await session.execute(update_stmt)
 
         if result.rowcount == 0:
-            return None, "Слот вже заповнений (Sold Out)"
+            return None, "Недостатньо вільних місць"
 
         # 6. Create booking
         new_booking = Booking(
@@ -124,7 +127,8 @@ async def create_booking(
             slot_id=slot.id,
             booking_date=slot.start_time,
             location=slot.location_code,
-            status="active"
+            status="active",
+            people_count=people_count
         )
         session.add(new_booking)
 
@@ -234,13 +238,19 @@ async def cancel_booking(
         # Mark as canceled
         booking.status = "canceled"
 
+        if booking.calendar_event_id:
+            try:
+                await asyncio.to_thread(delete_event, booking.calendar_event_id)
+            except Exception as e:
+                print(f"Calendar delete error: {e}")
+
         # Atomic decrement
         if booking.slot:
             stmt = (
                 update(Slot)
                 .where(Slot.id == booking.slot_id)
                 .where(Slot.booked_count > 0)
-                .values(booked_count=Slot.booked_count - 1)
+                .values(booked_count=func.max(0, Slot.booked_count - getattr(booking, "people_count", 1)))
                 .execution_options(synchronize_session="fetch")
             )
             await session.execute(stmt)
