@@ -27,8 +27,8 @@ from sqlalchemy import select, text, or_, and_, func
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
-from database.models import Base, Location, Slot, Booking, User, SlotTemplate
-from services.booking_service import create_booking, cancel_booking, get_bookings_for_day, fix_legacy_booking_user_ids
+from database.models import Base, Location, Slot, Booking, User, SlotTemplate, RecurringBookingTemplate
+from services.booking_service import create_booking, cancel_booking, get_bookings_for_day, fix_legacy_booking_user_ids, get_or_create_user
 from services.template_service import get_templates, create_template, delete_template, toggle_template, generate_week_slots
 from services.google_calendar import create_event
 
@@ -148,6 +148,12 @@ class AdminAddSlotStates(StatesGroup):
     choosing_time = State()
     choosing_capacity = State()
     confirming = State()
+
+class RecurringTemplateStates(StatesGroup):
+    choosing_weekday = State()
+    choosing_location = State()
+    choosing_time = State()
+    choosing_people_count = State()
 
 class AdminAddTemplateStates(StatesGroup):
     choosing_location = State()
@@ -685,6 +691,7 @@ def build_my_bookings_mode_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🟢 Активні записи", callback_data="my_mode:active")],
         [InlineKeyboardButton(text="📜 Історія записів", callback_data="my_mode:history")],
+        [InlineKeyboardButton(text="🔁 Мій графік", callback_data="my_schedule")],
         [InlineKeyboardButton(text="❌ Закрити", callback_data="my_close")],
     ])
 
@@ -938,6 +945,7 @@ def build_my_bookings_kb(bookings: list[Booking], mode: str = "active") -> Inlin
         InlineKeyboardButton(text="🟢 Активні", callback_data="my_mode:active"),
         InlineKeyboardButton(text="📜 Історія", callback_data="my_mode:history"),
     ])
+    rows.append([InlineKeyboardButton(text="🔁 Мій графік", callback_data="my_schedule")])
     rows.append([InlineKeyboardButton(text="❌ Закрити", callback_data="my_close")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -2571,6 +2579,200 @@ async def my_mode(callback: types.CallbackQuery):
 
 
 
+# ==========================================
+# My Weekly Schedule / Мій графік
+# ==========================================
+
+def build_my_schedule_kb(has_templates: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if has_templates:
+        rows.append([InlineKeyboardButton(text="🚀 Записати на наступний тиждень", callback_data="rebook_schedule")])
+        rows.append([InlineKeyboardButton(text="🗑 Видалити пункт", callback_data="del_schedule_list")])
+    rows.append([InlineKeyboardButton(text="➕ Додати", callback_data="add_schedule")])
+    rows.append([InlineKeyboardButton(text="❌ Закрити", callback_data="my_close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def render_my_schedule(message: Message, telegram_id: int):
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, telegram_id)
+        templates = (await session.execute(
+            select(RecurringBookingTemplate).where(RecurringBookingTemplate.user_id == user.id)
+        )).scalars().all()
+    
+    if not templates:
+        text = "У тебе поки немає збережених слотів."
+        await message.edit_text(text, reply_markup=build_my_schedule_kb(False))
+        return
+        
+    wd_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+    lines = ["Твій збережений графік:\n"]
+    for t in templates:
+        lines.append(f"• {wd_names[t.weekday]} • {t.time_str} • {t.location_code} • 👥 {t.people_count}")
+        
+    await message.edit_text("\n".join(lines), reply_markup=build_my_schedule_kb(True))
+
+@dp.callback_query(F.data == "my_schedule")
+async def show_my_schedule(callback: types.CallbackQuery):
+    await callback.answer()
+    await render_my_schedule(callback.message, callback.from_user.id)
+
+@dp.callback_query(F.data == "add_schedule")
+async def add_schedule_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(RecurringTemplateStates.choosing_weekday)
+    wd_names = ["Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота", "Неділя"]
+    rows = [[InlineKeyboardButton(text=wd, callback_data=f"rec_wd:{i}")] for i, wd in enumerate(wd_names)]
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="my_schedule")])
+    await callback.message.edit_text("Обери день тижня:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+@dp.callback_query(RecurringTemplateStates.choosing_weekday, F.data.startswith("rec_wd:"))
+async def add_schedule_wd(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.update_data(rec_wd=int(callback.data.split(":")[1]))
+    await state.set_state(RecurringTemplateStates.choosing_location)
+    rows = [[InlineKeyboardButton(text=lbl, callback_data=f"rec_loc:{k}")] for k, lbl in LOCATIONS.items()]
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="my_schedule")])
+    await callback.message.edit_text("Обери локацію:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+@dp.callback_query(RecurringTemplateStates.choosing_location, F.data.startswith("rec_loc:"))
+async def add_schedule_loc(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.update_data(rec_loc=LOCATIONS[callback.data.split(":")[1]])
+    await state.set_state(RecurringTemplateStates.choosing_time)
+    
+    times = [f"{h:02d}:{m:02d}" for h in range(8, 22) for m in (0, 30)]
+    rows = []
+    row = []
+    for t in times:
+        row.append(InlineKeyboardButton(text=t, callback_data=f"rec_tm:{t}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="my_schedule")])
+    await callback.message.edit_text("Обери час початку:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+@dp.callback_query(RecurringTemplateStates.choosing_time, F.data.startswith("rec_tm:"))
+async def add_schedule_time(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.update_data(rec_tm=callback.data.split(":", 1)[1])
+    await state.set_state(RecurringTemplateStates.choosing_people_count)
+    rows = [
+        [InlineKeyboardButton(text="1 👤", callback_data="rec_ppl:1"), InlineKeyboardButton(text="2 👥", callback_data="rec_ppl:2")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="my_schedule")]
+    ]
+    await callback.message.edit_text("Скільки людей буде?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+@dp.callback_query(RecurringTemplateStates.choosing_people_count, F.data.startswith("rec_ppl:"))
+async def add_schedule_ppl(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    ppl = int(callback.data.split(":")[1])
+    data = await state.get_data()
+    
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        session.add(RecurringBookingTemplate(
+            user_id=user.id,
+            weekday=data['rec_wd'],
+            location_code=data['rec_loc'],
+            time_str=data['rec_tm'],
+            people_count=ppl
+        ))
+        await session.commit()
+        
+    await state.clear()
+    
+    # Render the schedule directly
+    await render_my_schedule(callback.message, callback.from_user.id)
+
+@dp.callback_query(F.data == "del_schedule_list")
+async def del_schedule_list_cmd(callback: types.CallbackQuery):
+    await callback.answer()
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        templates = (await session.execute(
+            select(RecurringBookingTemplate).where(RecurringBookingTemplate.user_id == user.id)
+        )).scalars().all()
+        
+    if not templates:
+        await callback.message.edit_text("Немає збережених слотів", reply_markup=build_my_schedule_kb(False))
+        return
+        
+    wd_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+    rows = []
+    for t in templates:
+        text = f"🗑 {wd_names[t.weekday]} {t.time_str} {t.location_code} 👥{t.people_count}"
+        rows.append([InlineKeyboardButton(text=text, callback_data=f"del_sched:{t.id}")])
+    rows.append([InlineKeyboardButton(text="↩️ Назад", callback_data="my_schedule")])
+    await callback.message.edit_text("Обери пункт для видалення:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+@dp.callback_query(F.data.startswith("del_sched:"))
+async def del_sched_cmd(callback: types.CallbackQuery):
+    tid = int(callback.data.split(":")[1])
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        template = await session.get(RecurringBookingTemplate, tid)
+        if template and template.user_id == user.id:
+            await session.delete(template)
+            await session.commit()
+            
+    await callback.answer("Видалено")
+    await del_schedule_list_cmd(callback)
+
+@dp.callback_query(F.data == "rebook_schedule")
+async def rebook_schedule_cmd(callback: types.CallbackQuery):
+    await callback.message.edit_text("⏳ Записую тебе на наступний тиждень...")
+    await callback.answer()
+    
+    wd_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+    now = datetime.now()
+    today_date = now.date()
+    
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        templates = (await session.execute(
+            select(RecurringBookingTemplate).where(RecurringBookingTemplate.user_id == user.id)
+        )).scalars().all()
+        
+        lines = []
+        for t in templates:
+            days_ahead = t.weekday - today_date.weekday()
+            # If the weekday has already passed or is today, the NEXT week's weekday is:
+            target_date = today_date + timedelta(days=(days_ahead if days_ahead > 0 else days_ahead + 7))
+            hm = t.time_str.split(":")
+            target_start = datetime.combine(target_date, datetime.min.time().replace(hour=int(hm[0]), minute=int(hm[1])))
+            
+            slot = (await session.execute(
+                select(Slot).where(
+                    Slot.location_code == t.location_code,
+                    Slot.start_time == target_start
+                )
+            )).scalars().first()
+            
+            result_str = f"{wd_names[t.weekday]} • {t.time_str} • {t.location_code}"
+            
+            if not slot:
+                lines.append(f"❌ {result_str} • слота не існує")
+                continue
+                
+            booking, error = await create_booking(
+                session,
+                user_id=user.id,
+                slot_id=slot.id,
+                telegram_id=callback.from_user.id,
+                username=callback.from_user.username,
+                full_name=callback.from_user.full_name,
+                people_count=t.people_count
+            )
+            
+            if booking:
+                lines.append(f"✅ {result_str}")
+            else:
+                lines.append(f"❌ {result_str} • {error}")
+                
+    text = "⏳ Записую тебе на наступний тиждень...\n\n" + "\n".join(lines) + "\n\nГотово 💪"
+    rows = [[InlineKeyboardButton(text="↩️ Мій графік", callback_data="my_schedule")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 @dp.message()
 async def fallback(message: Message):

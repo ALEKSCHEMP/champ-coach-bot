@@ -84,3 +84,17 @@ class SlotTemplate(Base):
     capacity: Mapped[int] = mapped_column(Integer, default=1)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+class RecurringBookingTemplate(Base):
+    __tablename__ = "recurring_templates"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    location_code: Mapped[str] = mapped_column(String(20))
+    weekday: Mapped[int] = mapped_column(Integer) # 0=Mon, 6=Sun
+    time_str: Mapped[str] = mapped_column(String(5)) # HH:MM
+    people_count: Mapped[int] = mapped_column(Integer, default=1)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    user: Mapped["User"] = relationship("User")
