@@ -98,3 +98,12 @@ class RecurringBookingTemplate(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     
     user: Mapped["User"] = relationship("User")
+
+class WeeklyScheduleReminderLog(Base):
+    __tablename__ = "weekly_schedule_reminders"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    iso_year: Mapped[int] = mapped_column(Integer)
+    iso_week: Mapped[int] = mapped_column(Integer)
+    sent_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

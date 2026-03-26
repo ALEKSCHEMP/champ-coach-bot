@@ -27,7 +27,7 @@ from sqlalchemy import select, text, or_, and_, func
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
-from database.models import Base, Location, Slot, Booking, User, SlotTemplate, RecurringBookingTemplate
+from database.models import Base, Location, Slot, Booking, User, SlotTemplate, RecurringBookingTemplate, WeeklyScheduleReminderLog
 from services.booking_service import create_booking, cancel_booking, get_bookings_for_day, fix_legacy_booking_user_ids, get_or_create_user
 from services.template_service import get_templates, create_template, delete_template, toggle_template, generate_week_slots
 from services.google_calendar import create_event
@@ -115,6 +115,16 @@ async def ensure_columns():
             await conn.execute(
                 text("ALTER TABLE bookings ADD COLUMN people_count INTEGER DEFAULT 1")
             )    
+            
+        user_columns = await conn.run_sync(
+            lambda sync_conn: sync_conn.execute(text("PRAGMA table_info(users)")).fetchall()
+        )
+        user_col_names = [c[1] for c in user_columns]
+        
+        if "weekly_reminder_enabled" not in user_col_names:
+            await conn.execute(
+                text("ALTER TABLE users ADD COLUMN weekly_reminder_enabled BOOLEAN DEFAULT 0")
+            )
             
 async def init_db():
     async with engine.begin() as conn:
@@ -626,6 +636,48 @@ async def reminder_worker(bot: Bot):
 
                 if changed:
                     await session.commit()
+
+                # --- WEEKLY SCHEDULE REMINDER ---
+                if now.weekday() == 6 and 10 <= now.hour <= 20:
+                    iso_year, iso_week, _ = now.isocalendar()
+                    q_sched_users = (
+                        select(RecurringBookingTemplate.user_id)
+                        .join(User, User.id == RecurringBookingTemplate.user_id)
+                        .where(RecurringBookingTemplate.is_active == True)
+                        .where(User.weekly_reminder_enabled == True)
+                        .distinct()
+                    )
+                    sched_users = (await session.execute(q_sched_users)).scalars().all()
+                    
+                    for sid in sched_users:
+                        q_log = select(WeeklyScheduleReminderLog).where(
+                            WeeklyScheduleReminderLog.user_id == sid,
+                            WeeklyScheduleReminderLog.iso_year == iso_year,
+                            WeeklyScheduleReminderLog.iso_week == iso_week
+                        )
+                        has_log = (await session.execute(q_log)).scalar_one_or_none()
+                        
+                        if not has_log:
+                            u = await session.get(User, sid)
+                            if u and u.telegram_id:
+                                try:
+                                    kb = InlineKeyboardMarkup(inline_keyboard=[
+                                        [InlineKeyboardButton(text="🚀 Записати по моєму графіку", callback_data="rebook_schedule")]
+                                    ])
+                                    await bot.send_message(
+                                        u.telegram_id,
+                                        "Готовий розписати тренування на наступний тиждень? 💪",
+                                        reply_markup=kb
+                                    )
+                                    session.add(WeeklyScheduleReminderLog(
+                                        user_id=sid,
+                                        iso_year=iso_year,
+                                        iso_week=iso_week
+                                    ))
+                                    await session.commit()
+                                    logging.info(f"Weekly schedule reminder sent to user_id={sid}")
+                                except Exception as e:
+                                    logging.exception(f"Failed to send weekly schedule reminder to {sid}: {e}")
 
         except Exception as e:
             logging.exception(f"Reminder worker error: {e}")
@@ -2600,7 +2652,10 @@ async def render_my_schedule(message: Message, telegram_id: int):
         )).scalars().all()
     
     if not templates:
-        text = "У тебе поки немає збережених слотів."
+        text = (
+            "У тебе поки немає збережених слотів.\n\n"
+            "Додай свої регулярні тренування і записуйся на весь тиждень за 1 клік 💪"
+        )
         await message.edit_text(text, reply_markup=build_my_schedule_kb(False))
         return
         
@@ -2682,8 +2737,13 @@ async def add_schedule_ppl(callback: types.CallbackQuery, state: FSMContext):
         
     await state.clear()
     
-    # Render the schedule directly
-    await render_my_schedule(callback.message, callback.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ До мого графіку", callback_data="my_schedule")]
+    ])
+    await callback.message.edit_text(
+        "✅ Додано в твій графік\n\nТепер ти можеш записатися на весь тиждень в 1 клік 🚀",
+        reply_markup=kb
+    )
 
 @dp.callback_query(F.data == "del_schedule_list")
 async def del_schedule_list_cmd(callback: types.CallbackQuery):
@@ -2770,10 +2830,33 @@ async def rebook_schedule_cmd(callback: types.CallbackQuery):
             else:
                 lines.append(f"❌ {result_str} • {error}")
                 
-    text = "⏳ Записую тебе на наступний тиждень...\n\n" + "\n".join(lines) + "\n\nГотово 💪"
-    rows = [[InlineKeyboardButton(text="↩️ Мій графік", callback_data="my_schedule")]]
+    text = "⏳ Записую тебе на наступний тиждень...\n\n" + "\n".join(lines) + "\n\nГотово 💪\n\nХочеш, я нагадаю тобі про це наступної неділі? 😉"
+    rows = [
+        [
+            InlineKeyboardButton(text="✅ Так", callback_data="weekly_reminder_on"),
+            InlineKeyboardButton(text="❌ Ні", callback_data="weekly_reminder_off")
+        ],
+        [InlineKeyboardButton(text="↩️ Мій графік", callback_data="my_schedule")]
+    ]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
+@dp.callback_query(F.data == "weekly_reminder_on")
+async def weekly_reminder_on_cmd(callback: types.CallbackQuery):
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        user.weekly_reminder_enabled = True
+        await session.commit()
+    await callback.answer("Супер 👍 Буду нагадувати тобі щонеділі", show_alert=True)
+    await render_my_schedule(callback.message, callback.from_user.id)
+
+@dp.callback_query(F.data == "weekly_reminder_off")
+async def weekly_reminder_off_cmd(callback: types.CallbackQuery):
+    async with SessionLocal() as session:
+        user = await get_or_create_user(session, callback.from_user.id)
+        user.weekly_reminder_enabled = False
+        await session.commit()
+    await callback.answer("Ок, без нагадувань 👌", show_alert=True)
+    await render_my_schedule(callback.message, callback.from_user.id)
 @dp.message()
 async def fallback(message: Message):
     await message.answer(
