@@ -195,8 +195,8 @@ async def send_locations(target: Message):
 
     await target.answer(
         "📍 Локації тренувань\n\n"
-        "🏋️ Ocean\n"
-        "🏋️ Center\n\n"
+        "🏋️ Ocean(Володимира Великого)\n"
+        "🏋️ Center(Площа Старий ринок)\n\n"
         "Оберіть зал 👇",
         reply_markup=kb
     )
@@ -991,6 +991,14 @@ def build_my_bookings_kb(bookings: list[Booking], mode: str = "active") -> Inlin
                     callback_data=f"my_cancel:{b.id}"
                 )
             ])
+            now = datetime.now()
+            if b.slot and b.slot.start_time > now + timedelta(hours=4):
+                rows.append([
+                    InlineKeyboardButton(
+                        text=f"🔄 Перенести тренування",
+                        callback_data=f"reschedule:{b.id}"
+                    )
+                ])
 
     # навігація між режимами
     rows.append([
@@ -1836,14 +1844,49 @@ async def confirm_booking(callback: types.CallbackQuery, state: FSMContext):
 
     # 1. Создаём запись в БД
     async with SessionLocal() as session:
-        booking, msg = await create_booking(
-            session,
-            telegram_id=callback.from_user.id,
-            username=callback.from_user.username,
-            full_name=callback.from_user.full_name,
-            slot_id=int(slot_id),
-            people_count=int(people_count)
-        )
+        reschedule_id = data.get("reschedule_booking_id")
+        if reschedule_id:
+            q = select(Booking).options(joinedload(Booking.slot)).where(Booking.id == reschedule_id)
+            old_booking = (await session.execute(q)).scalar_one_or_none()
+            
+            if not old_booking or old_booking.status != "active":
+                await callback.message.answer("❌ Помилка: старий запис не знайдено або він вже неактивний.")
+                await state.clear()
+                return
+            if not old_booking.slot:
+                await callback.message.answer("❌ Помилка: слот старого запису відсутній.")
+                await state.clear()
+                return
+            if old_booking.slot.id == int(slot_id):
+                await callback.message.answer("❌ Ти обрав той самий слот. Перенесення скасовано.")
+                await state.clear()
+                return
+            if old_booking.slot.start_time <= datetime.now() + timedelta(hours=4):
+                await callback.message.answer("❌ Перенести тренування можна не пізніше ніж за 4 години до початку.")
+                await state.clear()
+                return
+                
+            booking, msg = await create_booking(
+                session,
+                telegram_id=callback.from_user.id,
+                username=callback.from_user.username,
+                full_name=callback.from_user.full_name,
+                slot_id=int(slot_id),
+                people_count=int(people_count)
+            )
+            if booking:
+                success, c_msg = await cancel_booking(session, reschedule_id, telegram_id=callback.from_user.id)
+                if not success:
+                    logging.error(f"Post-reschedule cancellation failed for booking {reschedule_id}: {c_msg}")
+        else:
+            booking, msg = await create_booking(
+                session,
+                telegram_id=callback.from_user.id,
+                username=callback.from_user.username,
+                full_name=callback.from_user.full_name,
+                slot_id=int(slot_id),
+                people_count=int(people_count)
+            )
 
     if not booking:
         await callback.message.answer(f"❌ {msg}")
@@ -1889,21 +1932,41 @@ async def confirm_booking(callback: types.CallbackQuery, state: FSMContext):
     slot_loc = booking.location
     slot_time = booking.booking_date
 
+    ctx = data.get("old_b_str")
+    if reschedule_id and ctx:
+        success_text = (
+            f"✅ Тренування успішно перенесено\n\n"
+            f"Було: {ctx}\n"
+            f"Стало: 📅 {slot_time.strftime('%d.%m.%Y')} • 🕒 {fmt_dt(slot_time)} • 📍 {slot_loc}"
+        )
+    else:
+        success_text = f"✅ Готово\n📍 {slot_loc}\n🕒 {fmt_dt(slot_time)}"
+
     await callback.message.answer(
-        f"✅ Готово\n📍 {slot_loc}\n🕒 {fmt_dt(slot_time)}",
+        success_text,
         reply_markup=build_main_kb(is_admin_user(callback.from_user))
     )
 
     # 4. Сообщение админу
     if ADMIN_ID and ADMIN_ID != 0:
-        await bot.send_message(
-            ADMIN_ID,
-            "🔥 НОВИЙ ЗАПИС\n"
-            f"👤 {user.full_name} (@{user.username or '—'})\n"
-            f"🆔 {user.id}\n"
-            f"📍 {slot_loc}\n"
-            f"🕒 {fmt_dt(slot_time)}"
-        )
+        if reschedule_id and ctx:
+            await bot.send_message(
+                ADMIN_ID,
+                "🔄 ПЕРЕНЕСЕННЯ ЗАПИСУ\n"
+                f"👤 {user.full_name} (@{user.username or '—'})\n"
+                f"🆔 {user.id}\n\n"
+                f"🔴 Було: {ctx}\n"
+                f"🟢 Стало: 📅 {slot_time.strftime('%d.%m.%Y')} • 🕒 {fmt_dt(slot_time)} • 📍 {slot_loc}"
+            )
+        else:
+            await bot.send_message(
+                ADMIN_ID,
+                "🔥 НОВИЙ ЗАПИС\n"
+                f"👤 {user.full_name} (@{user.username or '—'})\n"
+                f"🆔 {user.id}\n"
+                f"📍 {slot_loc}\n"
+                f"🕒 {fmt_dt(slot_time)}"
+            )
 
     await state.clear()
 
@@ -1914,22 +1977,30 @@ async def client_days_page(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(day_page=page)
     await state.set_state(BookingStates.choosing_day)
 
-    await callback.message.answer(
-        "Обери день для запису:",
-        reply_markup=build_client_days_kb(page=page)
-    )
+    data = await state.get_data()
+    ctx = f"🔄 Перенесення:\nПоточний запис: {data['old_b_str']}\n\n" if data.get("old_b_str") else ""
+
+    try:
+        await callback.message.edit_text(
+            f"{ctx}Обери день для запису:",
+            reply_markup=build_client_days_kb(page=page)
+        )
+    except TelegramBadRequest:
+        pass
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("dayiso:"))
 async def client_pick_day(callback: types.CallbackQuery, state: FSMContext):
     day_iso = callback.data.split(":", 1)[1]
 
+    data = await state.get_data()
     await state.update_data(target_day=day_iso)
     await state.set_state(BookingStates.choosing_location)
 
+    ctx = f"🔄 Перенесення:\nПоточний запис: {data['old_b_str']}\n\n" if data.get("old_b_str") else ""
     d = date.fromisoformat(day_iso)
-    await callback.message.answer(
-        f"Обери локацію на {d.strftime('%d.%m.%Y')}:",
+    await callback.message.edit_text(
+        f"{ctx}Обери локацію на {d.strftime('%d.%m.%Y')}:",
         reply_markup=build_client_locations_kb()
     )
     await callback.answer()
@@ -1952,15 +2023,19 @@ async def client_pick_location(callback: types.CallbackQuery, state: FSMContext)
 
     kb = await build_free_slots_kb(target_day, loc)
     if kb is None:
-        await callback.message.answer("На цей день вільних слотів немає.")
+        await callback.message.edit_text("На цей день вільних слотів немає.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Назад до розкладу", callback_data="daypage:0")]]))
         await callback.answer()
         return
 
+    ctx = f"🔄 Перенесення:\nПоточний запис: {data['old_b_str']}\n\n" if data.get("old_b_str") else ""
     title_loc = "Усі локації" if loc == "ALL" else loc
-    await callback.message.answer(
-        f"📅 {target_day.strftime('%d.%m.%Y')} • 📍 {title_loc}",
-        reply_markup=kb
-    )
+    try:
+        await callback.message.edit_text(
+            f"{ctx}📅 {target_day.strftime('%d.%m.%Y')} • 📍 {title_loc}\nОбери час:",
+            reply_markup=kb
+        )
+    except TelegramBadRequest:
+        pass
     await callback.answer()
 
 @dp.callback_query(F.data == "back_to_locations")
@@ -1969,16 +2044,20 @@ async def back_to_locations(callback: types.CallbackQuery, state: FSMContext):
     day_iso = data.get("target_day")
     if not day_iso:
         await state.clear()
-        await callback.message.answer("Почни знову: 📅 Записатися")
+        await callback.message.edit_text("Почни знову: 📅 Записатися")
         await callback.answer()
         return
 
     await state.set_state(BookingStates.choosing_location)
+    ctx = f"🔄 Перенесення:\nПоточний запис: {data['old_b_str']}\n\n" if data.get("old_b_str") else ""
     d = date.fromisoformat(day_iso)
-    await callback.message.answer(
-        f"Обери локацію на {d.strftime('%d.%m.%Y')}:",
-        reply_markup=build_client_locations_kb()
-    )
+    try:
+        await callback.message.edit_text(
+            f"{ctx}Обери локацію на {d.strftime('%d.%m.%Y')}:",
+            reply_markup=build_client_locations_kb()
+        )
+    except TelegramBadRequest:
+        pass
     await callback.answer()
 
 
@@ -2008,6 +2087,7 @@ async def choose_slot(callback: types.CallbackQuery, state: FSMContext):
 
     # Переходимо на вибір кількості людей
     await state.set_state(BookingStates.choosing_people_count)
+    data = await state.get_data()
     await state.update_data(slot_id=slot_id)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2017,10 +2097,14 @@ async def choose_slot(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_booking")]
     ])
 
-    await callback.message.answer(
-        "Скільки людей буде?",
-        reply_markup=kb
-    )
+    ctx = f"🔄 Перенесення:\nПоточний запис: {data['old_b_str']}\n\n" if data.get("old_b_str") else ""
+    try:
+        await callback.message.edit_text(
+            f"{ctx}Скільки людей буде?",
+            reply_markup=kb
+        )
+    except TelegramBadRequest:
+        pass
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("people_count:"))
@@ -2053,18 +2137,33 @@ async def choose_people_count(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(BookingStates.confirming)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Підтвердити", callback_data="confirm_booking")],
+        [InlineKeyboardButton(text="✅ Підтвердити" + (" перенесення" if data.get("old_b_str") else ""), callback_data="confirm_booking")],
         [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_slots")],
         [InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel_booking")],
     ])
 
-    await callback.message.answer(
-        "Підтвердити запис?\n\n"
-        f"📍 {slot.location_code}\n"
-        f"🕒 {fmt_dt(slot.start_time)}\n"
-        f"👥 Кількість людей: {people_count}",
-        reply_markup=kb
-    )
+    ctx = data.get("old_b_str")
+    if ctx:
+        text = (
+            f"Підтверди перенесення тренування:\n\n"
+            f"Було: {ctx}\n"
+            f"Стане: 📅 {slot.start_time.strftime('%d.%m.%Y')} • 🕒 {fmt_dt(slot.start_time)} • 📍 {slot.location_code} • 👥 {people_count}"
+        )
+    else:
+        text = (
+            f"Підтвердити запис?\n\n"
+            f"📍 {slot.location_code}\n"
+            f"🕒 {fmt_dt(slot.start_time)}\n"
+            f"👥 Кількість людей: {people_count}"
+        )
+
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=kb
+        )
+    except TelegramBadRequest:
+        pass
     await callback.answer()
 
 
@@ -2078,20 +2177,33 @@ async def back_to_slots(callback: types.CallbackQuery, state: FSMContext):
 
 
     if kb is None:
-        await callback.message.answer("На цей день вільних слотів немає.")
+        await callback.message.edit_text("На цей день вільних слотів немає.")
         await state.clear()
         await callback.answer()
         return
 
     await state.set_state(BookingStates.choosing_slot)
-    await callback.message.answer("Обери вільний час:", reply_markup=kb)
+    ctx = f"🔄 Перенесення:\nПоточний запис: {data.get('old_b_str')}\n\n" if data.get("old_b_str") else ""
+    try:
+        await callback.message.edit_text(f"{ctx}Обери вільний час:", reply_markup=kb)
+    except TelegramBadRequest:
+        pass
     await callback.answer()
 
 
 @dp.callback_query(F.data == "cancel_booking")
 async def cancel_booking_process(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    is_reschedule = "reschedule_booking_id" in data
     await state.clear()
-    await callback.message.answer("Запис скасовано.")
+    
+    try:
+        if is_reschedule:
+            await callback.message.edit_text("❌ Перенесення скасовано.\nТвій поточний запис залишається активним.")
+        else:
+            await callback.message.edit_text("❌ Запис скасовано.")
+    except TelegramBadRequest:
+        pass
     await callback.answer()
 
 
@@ -2857,6 +2969,50 @@ async def weekly_reminder_off_cmd(callback: types.CallbackQuery):
         await session.commit()
     await callback.answer("Ок, без нагадувань 👌", show_alert=True)
     await render_my_schedule(callback.message, callback.from_user.id)
+@dp.callback_query(F.data.startswith("reschedule:"))
+async def reschedule_booking_cmd(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        booking_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Помилка: некоректні дані", show_alert=True)
+        return
+
+    async with SessionLocal() as session:
+        q = select(Booking).options(joinedload(Booking.slot)).where(Booking.id == booking_id)
+        booking = (await session.execute(q)).scalar_one_or_none()
+        
+        if not booking or booking.status != "active":
+            await callback.answer("Помилка: запис не знайдено або він вже скасований", show_alert=True)
+            return
+            
+        user = await get_or_create_user(session, callback.from_user.id)
+        if booking.user_id != user.id:
+            await callback.answer("Помилка: це не ваше бронювання", show_alert=True)
+            return
+            
+        if not booking.slot:
+            await callback.answer("Помилка: слот старого запису пошкоджено", show_alert=True)
+            return
+            
+        if booking.slot.start_time <= datetime.now() + timedelta(hours=4):
+            await callback.answer("Перенести тренування можна не пізніше ніж за 4 години до початку.", show_alert=True)
+            return
+
+    await state.set_state(BookingStates.choosing_day)
+    await state.update_data(reschedule_booking_id=booking_id)
+
+    kb = build_client_days_kb()
+    if kb:
+        await callback.message.edit_text(
+            "🔄 Перенесення тренування.\n\n"
+            "Обери новий день для запису 👇\n\n"
+            "Показані тільки дні, де є вільні місця.",
+            reply_markup=kb
+        )
+    else:
+        await callback.message.edit_text("Немає доступних днів для запису.")
+    await callback.answer()
+
 @dp.message()
 async def fallback(message: Message):
     await message.answer(
