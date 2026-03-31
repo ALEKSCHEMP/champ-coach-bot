@@ -7,7 +7,7 @@ from database.models import Slot, Booking, User
 import asyncio
 
 logger = logging.getLogger(__name__)
-from services.google_calendar import delete_event
+from services.google_calendar import safe_delete_calendar_event
 
 async def get_slots_by_date(
     session: AsyncSession, 
@@ -251,10 +251,7 @@ async def cancel_booking(
         booking.status = "canceled"
 
         if booking.calendar_event_id:
-            try:
-                await asyncio.to_thread(delete_event, booking.calendar_event_id)
-            except Exception as e:
-                logger.exception("calendar_event_delete_failed", extra={"calendar_event_id": booking.calendar_event_id}, exc_info=e)
+            await safe_delete_calendar_event(booking.calendar_event_id)
 
         # Atomic decrement
         if booking.slot:

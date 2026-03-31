@@ -1,6 +1,8 @@
 import os
 import logging
 from datetime import datetime
+import asyncio
+from googleapiclient.errors import HttpError
 
 logger = logging.getLogger(__name__)
 from google.oauth2.credentials import Credentials
@@ -48,43 +50,80 @@ def get_calendar_service():
 
 
 def create_event(summary: str, description: str, start_dt: datetime, end_dt: datetime) -> str:
-    logger.info("calendar_event_create_started")
-    try:
-        service = get_calendar_service()
+    service = get_calendar_service()
 
-        event_body = {
-            "summary": summary,
-            "description": description,
-            "start": {
-                "dateTime": start_dt.isoformat(),
-                "timeZone": "Europe/Kyiv",
-            },
-            "end": {
-                "dateTime": end_dt.isoformat(),
-                "timeZone": "Europe/Kyiv",
-            },
-        }
+    event_body = {
+        "summary": summary,
+        "description": description,
+        "start": {
+            "dateTime": start_dt.isoformat(),
+            "timeZone": "Europe/Kyiv",
+        },
+        "end": {
+            "dateTime": end_dt.isoformat(),
+            "timeZone": "Europe/Kyiv",
+        },
+    }
 
-        event = service.events().insert(
-            calendarId="primary",
-            body=event_body
-        ).execute()
+    event = service.events().insert(
+        calendarId="primary",
+        body=event_body
+    ).execute()
 
-        logger.info("calendar_event_created", extra={"calendar_event_id": event["id"]})
-        return event["id"]
-    except Exception as e:
-        logger.exception("calendar_event_create_failed")
-        raise e
+    return event["id"]
 
 def delete_event(event_id: str):
+    service = get_calendar_service()
+    service.events().delete(
+        calendarId="primary",
+        eventId=event_id
+    ).execute()
+
+
+async def safe_create_calendar_event(summary: str, description: str, start_dt: datetime, end_dt: datetime) -> str | None:
+    delays = [0, 1, 2] # 3 attempts
+    logger.info("calendar_event_create_started")
+    last_exception = None
+    for attempt, delay in enumerate(delays, start=1):
+        if attempt > 1:
+            logger.warning("calendar_event_create_retry", extra={"attempt": attempt, "error": str(last_exception)})
+            await asyncio.sleep(delay)
+        try:
+            event_id = await asyncio.to_thread(create_event, summary, description, start_dt, end_dt)
+            logger.info("calendar_event_created", extra={"calendar_event_id": event_id})
+            return event_id
+        except HttpError as e:
+            last_exception = e
+            if e.resp.status in [400, 401, 403, 404]: 
+                logger.exception("calendar_event_create_failed", exc_info=e)
+                return None
+        except Exception as e:
+            last_exception = e
+            
+    if last_exception:
+        logger.exception("calendar_event_create_failed", exc_info=last_exception)
+    return None
+
+async def safe_delete_calendar_event(event_id: str) -> bool:
+    delays = [0, 1, 2]
     logger.info("calendar_event_delete_started", extra={"calendar_event_id": event_id})
-    try:
-        service = get_calendar_service()
-        service.events().delete(
-            calendarId="primary",
-            eventId=event_id
-        ).execute()
-        logger.info("calendar_event_deleted", extra={"calendar_event_id": event_id})
-    except Exception as e:
-        logger.exception("calendar_event_delete_failed", extra={"calendar_event_id": event_id})
-        raise e
+    last_exception = None
+    for attempt, delay in enumerate(delays, start=1):
+        if attempt > 1:
+            logger.warning("calendar_event_delete_retry", extra={"attempt": attempt, "error": str(last_exception), "calendar_event_id": event_id})
+            await asyncio.sleep(delay)
+        try:
+            await asyncio.to_thread(delete_event, event_id)
+            logger.info("calendar_event_deleted", extra={"calendar_event_id": event_id})
+            return True
+        except HttpError as e:
+            last_exception = e
+            if e.resp.status in [400, 401, 403, 404]:
+                logger.exception("calendar_event_delete_failed", extra={"calendar_event_id": event_id}, exc_info=e)
+                return False
+        except Exception as e:
+            last_exception = e
+            
+    if last_exception:
+        logger.exception("calendar_event_delete_failed", extra={"calendar_event_id": event_id}, exc_info=last_exception)
+    return False
