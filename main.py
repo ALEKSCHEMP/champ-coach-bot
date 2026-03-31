@@ -508,181 +508,211 @@ async def safe_edit_text(message: Message, text: str, reply_markup=None) -> bool
         raise
     
 
-async def reminder_worker(bot: Bot):
-    while True:
-        try:
-            now = datetime.now()
+logger = logging.getLogger(__name__)
 
-            async with SessionLocal() as session:
-                q = (
-                    select(Booking)
-                    .join(Slot, Booking.slot_id == Slot.id)
-                    .options(joinedload(Booking.slot), joinedload(Booking.user))
-                    .where(
-                        Booking.status == "active",
-                        Slot.start_time > now - timedelta(days=1)
+async def reminder_iteration(bot: Bot):
+    now = datetime.now()
+    async with SessionLocal() as session:
+        q = (
+            select(Booking)
+            .join(Slot, Booking.slot_id == Slot.id)
+            .options(joinedload(Booking.slot), joinedload(Booking.user))
+            .where(
+                Booking.status == "active",
+                Slot.start_time > now - timedelta(days=1)
+            )
+        )
+        bookings = (await session.execute(q)).scalars().unique().all()
+
+        checked = len(bookings)
+        sent = 0
+        failed = 0
+        changed = False
+
+        for b in bookings:
+            if not b.user or not b.slot:
+                continue
+
+            slot_time = b.slot.start_time
+            time_to_training = slot_time - now
+            
+            try:
+                # 0. Напоминание за 24 часа
+                if (not b.reminder_24h_sent and timedelta(hours=23) <= time_to_training <= timedelta(hours=24)):
+                    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Буду", callback_data=f"confirm_yes:{b.id}"),
+                         InlineKeyboardButton(text="❌ Не прийду", callback_data=f"confirm_no:{b.id}")],
+                        [InlineKeyboardButton(text="🔁 Перенести", callback_data=f"reschedule_start:{b.id}")]
+                    ])
+                    await bot.send_message(
+                        b.user.telegram_id,
+                        f"⏰ Нагадування: тренування завтра\n"
+                        f"📍 {b.location}\n"
+                        f"🕒 {fmt_dt(slot_time)}\n\n"
+                        f"Підтверди, будь ласка, чи будеш 👇",
+                        reply_markup=confirm_kb
                     )
+                    b.reminder_24h_sent = True
+                    changed = True
+                    sent += 1
+                    logger.info(f"24h reminder sent for booking_id={b.id}")
+
+                # 1. Утреннее напоминание
+                elif (not b.reminder_morning_sent and slot_time.date() == now.date() and 8 <= now.hour < 12):
+                    await bot.send_message(
+                        b.user.telegram_id,
+                        f"☀️ Нагадування про тренування сьогодні\n"
+                        f"📍 {b.location}\n"
+                        f"🕒 {fmt_dt(slot_time)}"
+                    )
+                    b.reminder_morning_sent = True
+                    changed = True
+                    sent += 1
+                    logger.info(f"Morning reminder sent for booking_id={b.id}")
+
+                # 2. Дневное напоминание за 3 часа
+                elif (not b.reminder_day_sent and timedelta(hours=0) < time_to_training <= timedelta(hours=3)):
+                    await bot.send_message(
+                        b.user.telegram_id,
+                        f"🔔 Нагадування: тренування вже скоро\n"
+                        f"📍 {b.location}\n"
+                        f"🕒 {fmt_dt(slot_time)}\n"
+                        f"Побачимось 💪"
+                    )
+                    b.reminder_day_sent = True
+                    changed = True
+                    sent += 1
+                    logger.info(f"Day reminder sent for booking_id={b.id}")
+            except Exception:
+                failed += 1
+                logger.exception("failed to process booking in reminder_iteration", extra={"booking_id": b.id, "user_id": b.user_id, "slot_id": b.slot_id})
+
+        if changed:
+            await session.commit()
+            
+        logger.info(f"reminder_iteration finished: checked={checked} sent={sent} failed={failed}")
+
+async def post_workout_iteration(bot: Bot):
+    now = datetime.now()
+    async with SessionLocal() as session:
+        q = (
+            select(Booking)
+            .join(Slot, Booking.slot_id == Slot.id)
+            .options(joinedload(Booking.slot), joinedload(Booking.user))
+            .where(
+                Booking.status == "active",
+                Slot.start_time > now - timedelta(days=1)
+            )
+        )
+        bookings = (await session.execute(q)).scalars().unique().all()
+        
+        checked = len(bookings)
+        sent = 0
+        failed = 0
+        changed = False
+
+        for b in bookings:
+            if not b.user or not b.slot:
+                continue
+
+            try:
+                # 3. Post-workout offer
+                if (not getattr(b, "post_workout_offer_sent", False) and b.slot.start_time < now - timedelta(minutes=90)):
+                    await bot.send_message(
+                        b.user.telegram_id,
+                        POST_WORKOUT_TEXT,
+                        reply_markup=post_workout_rebook_kb(b.id)
+                    )
+                    b.post_workout_offer_sent = True
+                    changed = True
+                    sent += 1
+                    logger.info(f"Post-workout offer sent for booking_id={b.id}")
+            except Exception:
+                failed += 1
+                logger.exception("failed to process booking in post_workout_iteration", extra={"booking_id": b.id, "user_id": b.user_id, "slot_id": b.slot_id})
+
+        if changed:
+            await session.commit()
+
+        logger.info(f"post_workout_iteration finished: checked={checked} sent={sent} failed={failed}")
+
+async def weekly_reminder_iteration(bot: Bot):
+    now = datetime.now()
+    if not (now.weekday() == 6 and 10 <= now.hour <= 20):
+        return
+
+    async with SessionLocal() as session:
+        iso_year, iso_week, _ = now.isocalendar()
+        q_sched_users = (
+            select(RecurringBookingTemplate.user_id)
+            .join(User, User.id == RecurringBookingTemplate.user_id)
+            .where(RecurringBookingTemplate.is_active == True)
+            .where(User.weekly_reminder_enabled == True)
+            .distinct()
+        )
+        sched_users = (await session.execute(q_sched_users)).scalars().all()
+        
+        checked = len(sched_users)
+        sent = 0
+        failed = 0
+
+        for sid in sched_users:
+            try:
+                q_log = select(WeeklyScheduleReminderLog).where(
+                    WeeklyScheduleReminderLog.user_id == sid,
+                    WeeklyScheduleReminderLog.iso_year == iso_year,
+                    WeeklyScheduleReminderLog.iso_week == iso_week
                 )
-
-                bookings = (await session.execute(q)).scalars().unique().all()
-
-                changed = False
-
-                for b in bookings:
-                    if not b.user or not b.slot:
-                        continue
-
-                    slot_time = b.slot.start_time
-                    time_to_training = slot_time - now
-                    
-                     # 0. Напоминание за 24 часа
-                    if (
-                        not b.reminder_24h_sent
-                        and timedelta(hours=23) <= time_to_training <= timedelta(hours=24)
-                    ):
-                        try:
-                            confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
-                                [
-                                    InlineKeyboardButton(text="✅ Буду", callback_data=f"confirm_yes:{b.id}"),
-                                    InlineKeyboardButton(text="❌ Не прийду", callback_data=f"confirm_no:{b.id}")
-                                ],
-                                [
-                                    InlineKeyboardButton(text="🔁 Перенести", callback_data=f"reschedule_start:{b.id}")
-                                ]
-                            ])
-
-                            await bot.send_message(
-                                b.user.telegram_id,
-                                f"⏰ Нагадування: тренування завтра\n"
-                                f"📍 {b.location}\n"
-                                f"🕒 {fmt_dt(slot_time)}\n\n"
-                                f"Підтверди, будь ласка, чи будеш 👇",
-                                reply_markup=confirm_kb
-                            )
-
-                            b.reminder_24h_sent = True
-                            changed = True
-                            logging.info(f"24h reminder sent for booking_id={b.id}")
-
-                        except Exception as e:
-                            logging.exception(
-                                f"Failed to send 24h reminder for booking_id={b.id}: {e}"
-                            )
-
-                    # 1. Утреннее напоминание:
-                    # если тренировка сегодня, время уже после 08:00,
-                    # напоминание ещё не отправлялось, и тренировка ещё впереди
-                    if (
-                        not b.reminder_morning_sent
-                        and slot_time.date() == now.date()
-                        and 8 <= now.hour < 12
-                    ):
-                        try:
-                            await bot.send_message(
-                                b.user.telegram_id,
-                                f"☀️ Нагадування про тренування сьогодні\n"
-                                f"📍 {b.location}\n"
-                                f"🕒 {fmt_dt(slot_time)}"
-                            )
-                            b.reminder_morning_sent = True
-                            changed = True
-                            logging.info(f"Morning reminder sent for booking_id={b.id}")
-                        except Exception as e:
-                            logging.exception(
-                                f"Failed to send morning reminder for booking_id={b.id}: {e}"
-                            )
-
-                    # 2. Дневное напоминание за 3 часа
-                    if (
-                        not b.reminder_day_sent
-                        and timedelta(hours=0) < time_to_training <= timedelta(hours=3)
-                    ):
-                        try:
-                            await bot.send_message(
-                                b.user.telegram_id,
-                                f"🔔 Нагадування: тренування вже скоро\n"
-                                f"📍 {b.location}\n"
-                                f"🕒 {fmt_dt(slot_time)}\n"
-                                f"Побачимось 💪"
-                            )
-                            b.reminder_day_sent = True
-                            changed = True
-                            logging.info(f"Day reminder sent for booking_id={b.id}")
-                        except Exception as e:
-                            logging.exception(
-                                f"Failed to send day reminder for booking_id={b.id}: {e}"
-                            )
-
-                    # 3. Post-workout offer
-                    if (
-                        not getattr(b, "post_workout_offer_sent", False)
-                        and b.status == "active"
-                        and b.slot
-                        and b.slot.start_time < now - timedelta(minutes=90)
-                    ):
-                        try:
-                            await bot.send_message(
-                                b.user.telegram_id,
-                                POST_WORKOUT_TEXT,
-                                reply_markup=post_workout_rebook_kb(b.id)
-                            )
-                            b.post_workout_offer_sent = True
-                            changed = True
-                            logging.info(f"Post-workout offer sent for booking_id={b.id}")
-                        except Exception as e:
-                            logging.exception(
-                                f"Failed to send post-workout offer for booking_id={b.id}: {e}"
-                            )
-
-                if changed:
-                    await session.commit()
-
-                # --- WEEKLY SCHEDULE REMINDER ---
-                if now.weekday() == 6 and 10 <= now.hour <= 20:
-                    iso_year, iso_week, _ = now.isocalendar()
-                    q_sched_users = (
-                        select(RecurringBookingTemplate.user_id)
-                        .join(User, User.id == RecurringBookingTemplate.user_id)
-                        .where(RecurringBookingTemplate.is_active == True)
-                        .where(User.weekly_reminder_enabled == True)
-                        .distinct()
-                    )
-                    sched_users = (await session.execute(q_sched_users)).scalars().all()
-                    
-                    for sid in sched_users:
-                        q_log = select(WeeklyScheduleReminderLog).where(
-                            WeeklyScheduleReminderLog.user_id == sid,
-                            WeeklyScheduleReminderLog.iso_year == iso_year,
-                            WeeklyScheduleReminderLog.iso_week == iso_week
+                has_log = (await session.execute(q_log)).scalar_one_or_none()
+                
+                if not has_log:
+                    u = await session.get(User, sid)
+                    if u and u.telegram_id:
+                        kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🚀 Записати по моєму графіку", callback_data="rebook_schedule")]
+                        ])
+                        await bot.send_message(
+                            u.telegram_id,
+                            "Готовий розписати тренування на наступний тиждень? 💪",
+                            reply_markup=kb
                         )
-                        has_log = (await session.execute(q_log)).scalar_one_or_none()
-                        
-                        if not has_log:
-                            u = await session.get(User, sid)
-                            if u and u.telegram_id:
-                                try:
-                                    kb = InlineKeyboardMarkup(inline_keyboard=[
-                                        [InlineKeyboardButton(text="🚀 Записати по моєму графіку", callback_data="rebook_schedule")]
-                                    ])
-                                    await bot.send_message(
-                                        u.telegram_id,
-                                        "Готовий розписати тренування на наступний тиждень? 💪",
-                                        reply_markup=kb
-                                    )
-                                    session.add(WeeklyScheduleReminderLog(
-                                        user_id=sid,
-                                        iso_year=iso_year,
-                                        iso_week=iso_week
-                                    ))
-                                    await session.commit()
-                                    logging.info(f"Weekly schedule reminder sent to user_id={sid}")
-                                except Exception as e:
-                                    logging.exception(f"Failed to send weekly schedule reminder to {sid}: {e}")
+                        session.add(WeeklyScheduleReminderLog(
+                            user_id=sid,
+                            iso_year=iso_year,
+                            iso_week=iso_week
+                        ))
+                        await session.commit()
+                        sent += 1
+                        logger.info(f"Weekly schedule reminder sent to user_id={sid}")
+            except Exception:
+                failed += 1
+                logger.exception("failed to process user in weekly_reminder_iteration", extra={"user_id": sid})
+                
+        if checked > 0:
+            logger.info(f"weekly_reminder_iteration finished: checked={checked} sent={sent} failed={failed}")
 
-        except Exception as e:
-            logging.exception(f"Reminder worker error: {e}")
+async def reminder_worker(bot: Bot):
+    logger.info("reminder_worker started")
+    while True:
+        logger.info("reminder_worker tick")
+        
+        try:
+            await reminder_iteration(bot)
+        except Exception:
+            logger.exception("reminder_worker iteration failed")
+
+        try:
+            await post_workout_iteration(bot)
+        except Exception:
+            logger.exception("post_workout_iteration failed")
+
+        try:
+            await weekly_reminder_iteration(bot)
+        except Exception:
+            logger.exception("weekly_reminder_iteration failed")
 
         await asyncio.sleep(60)
+
    
 
 
