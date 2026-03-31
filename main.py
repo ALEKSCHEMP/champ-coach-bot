@@ -34,8 +34,11 @@ from services.google_calendar import create_event
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
-
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 logging.info(f"ADMIN_ID={ADMIN_ID}")
@@ -1676,6 +1679,7 @@ async def myid(message: Message):
 
 @dp.message(F.text == "📅 Записатися на тренування")
 async def start_booking(message: Message, state: FSMContext):
+    logger.info("booking_flow_started", extra={"telegram_id": message.from_user.id})
     await state.clear()
     await state.set_state(BookingStates.choosing_day)
     await state.update_data(day_page=0)
@@ -2022,6 +2026,7 @@ async def client_days_page(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("dayiso:"))
 async def client_pick_day(callback: types.CallbackQuery, state: FSMContext):
     day_iso = callback.data.split(":", 1)[1]
+    logger.info("booking_date_selected", extra={"telegram_id": callback.from_user.id, "date": day_iso})
 
     data = await state.get_data()
     await state.update_data(target_day=day_iso)
@@ -2038,6 +2043,7 @@ async def client_pick_day(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("cloc:"))
 async def client_pick_location(callback: types.CallbackQuery, state: FSMContext):
     loc = callback.data.split(":", 1)[1]
+    logger.info("booking_location_selected", extra={"telegram_id": callback.from_user.id, "location": loc})
     data = await state.get_data()
     day_iso = data.get("target_day")
 
@@ -2099,6 +2105,7 @@ async def choose_slot(callback: types.CallbackQuery, state: FSMContext):
         return
 
     slot_id = int(callback.data.split(":")[1])
+    logger.info("booking_slot_selected", extra={"telegram_id": callback.from_user.id, "slot_id": slot_id})
 
     async with SessionLocal() as session:
         slot = (await session.execute(
@@ -3035,6 +3042,7 @@ async def weekly_reminder_off_cmd(callback: types.CallbackQuery):
 async def reschedule_booking_cmd(callback: types.CallbackQuery, state: FSMContext):
     try:
         booking_id = int(callback.data.split(":")[1])
+        logger.info("booking_reschedule_started", extra={"telegram_id": callback.from_user.id, "booking_id": booking_id})
     except (IndexError, ValueError):
         await callback.answer("Помилка: некоректні дані", show_alert=True)
         return

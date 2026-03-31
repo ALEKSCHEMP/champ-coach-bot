@@ -2,6 +2,7 @@ import os
 import logging
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -21,7 +22,7 @@ def get_calendar_service():
         try:
             creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
         except Exception as e:
-            logging.exception(f"Failed to load token.json: {e}")
+            logger.exception("Failed to load token.json", exc_info=e)
             creds = None
 
     if not creds or not creds.valid:
@@ -29,7 +30,7 @@ def get_calendar_service():
             try:
                 creds.refresh(Request())
             except Exception as e:
-                logging.exception(f"Failed to refresh token: {e}")
+                logger.exception("Failed to refresh token", exc_info=e)
                 creds = None
 
         if not creds or not creds.valid:
@@ -47,33 +48,43 @@ def get_calendar_service():
 
 
 def create_event(summary: str, description: str, start_dt: datetime, end_dt: datetime) -> str:
-    service = get_calendar_service()
+    logger.info("calendar_event_create_started")
+    try:
+        service = get_calendar_service()
 
-    event_body = {
-        "summary": summary,
-        "description": description,
-        "start": {
-            "dateTime": start_dt.isoformat(),
-            "timeZone": "Europe/Kyiv",
-        },
-        "end": {
-            "dateTime": end_dt.isoformat(),
-            "timeZone": "Europe/Kyiv",
-        },
-    }
+        event_body = {
+            "summary": summary,
+            "description": description,
+            "start": {
+                "dateTime": start_dt.isoformat(),
+                "timeZone": "Europe/Kyiv",
+            },
+            "end": {
+                "dateTime": end_dt.isoformat(),
+                "timeZone": "Europe/Kyiv",
+            },
+        }
 
-    event = service.events().insert(
-        calendarId="primary",
-        body=event_body
-    ).execute()
+        event = service.events().insert(
+            calendarId="primary",
+            body=event_body
+        ).execute()
 
-    return event["id"]
+        logger.info("calendar_event_created", extra={"calendar_event_id": event["id"]})
+        return event["id"]
+    except Exception as e:
+        logger.exception("calendar_event_create_failed")
+        raise e
 
 def delete_event(event_id: str):
-    logging.info(f"Google Calendar: deleting event_id={event_id}")
-    service = get_calendar_service()
-    service.events().delete(
-        calendarId="primary",
-        eventId=event_id
-    ).execute()
-    logging.info(f"Google Calendar: event deleted event_id={event_id}")
+    logger.info("calendar_event_delete_started", extra={"calendar_event_id": event_id})
+    try:
+        service = get_calendar_service()
+        service.events().delete(
+            calendarId="primary",
+            eventId=event_id
+        ).execute()
+        logger.info("calendar_event_deleted", extra={"calendar_event_id": event_id})
+    except Exception as e:
+        logger.exception("calendar_event_delete_failed", extra={"calendar_event_id": event_id})
+        raise e

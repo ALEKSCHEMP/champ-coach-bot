@@ -1,7 +1,10 @@
+import logging
 from datetime import date, datetime, timedelta
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from database.models import SlotTemplate, Slot
+
+logger = logging.getLogger(__name__)
 
 def _get_monday_date(target_date: date) -> date:
     return target_date - timedelta(days=target_date.weekday())
@@ -33,6 +36,7 @@ async def create_template(
     )
     session.add(tmpl)
     await session.commit()
+    logger.info("template_created", extra={"template_id": tmpl.id, "location": location_code, "weekday": weekday})
     return tmpl
 
 async def delete_template(session: AsyncSession, template_id: int) -> bool:
@@ -41,6 +45,7 @@ async def delete_template(session: AsyncSession, template_id: int) -> bool:
         return False
     await session.delete(tmpl)
     await session.commit()
+    logger.info("template_deleted", extra={"template_id": template_id})
     return True
 
 async def toggle_template(session: AsyncSession, template_id: int) -> bool:
@@ -110,6 +115,7 @@ async def generate_week_slots(session: AsyncSession, target_date: date) -> tuple
         session.add_all(new_slots)
         await session.commit()
     
+    logger.info("week_slots_generated", extra={"created_count": created_count, "skipped_count": skipped_count, "target_date": target_date.isoformat()})
     return created_count, skipped_count
 
 async def calculate_templates_from_week(session: AsyncSession, target_date: date) -> list[SlotTemplate]:
@@ -226,5 +232,6 @@ async def save_imported_templates(session: AsyncSession, templates: list[SlotTem
         session.add_all(templates)
         saved = len(templates)
         await session.commit()
+        logger.info("templates_imported", extra={"saved_count": saved, "replace_mode": replace_mode})
         
     return saved

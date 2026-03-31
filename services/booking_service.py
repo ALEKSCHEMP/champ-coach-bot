@@ -1,9 +1,12 @@
+import logging
 from datetime import date, datetime, timedelta
 from sqlalchemy import select, update, and_, desc, asc, func
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
 from database.models import Slot, Booking, User
 import asyncio
+
+logger = logging.getLogger(__name__)
 from services.google_calendar import delete_event
 
 async def get_slots_by_date(
@@ -66,6 +69,7 @@ async def create_booking(
     full_name: str | None = None,
     people_count: int = 1
 ) -> tuple[Booking | None, str]:
+    logger.info("booking_creation_started", extra={"user_id": user_id, "telegram_id": telegram_id, "slot_id": slot_id, "people_count": people_count})
     try:
         # 1. Resolve User
         if telegram_id:
@@ -89,6 +93,7 @@ async def create_booking(
             )
         )
         if existing_booking.scalar_one_or_none():
+            logger.warning("booking_creation_blocked_duplicate", extra={"user_id": user_id, "slot_id": slot_id})
             return None, "Ви вже записані на цей слот"
 
         # 4. Prevent booking another slot at the same time
@@ -105,6 +110,7 @@ async def create_booking(
             )
         )
         if same_time_booking.scalar_one_or_none():
+            logger.warning("booking_creation_blocked_overlap", extra={"user_id": user_id, "slot_id": slot_id})
             return None, "У вас вже є інший запис, який перетинається з цим часом"
 
         # 5. Atomic capacity update
@@ -119,6 +125,7 @@ async def create_booking(
         result = await session.execute(update_stmt)
 
         if result.rowcount == 0:
+            logger.warning("booking_creation_blocked_no_capacity", extra={"user_id": user_id, "slot_id": slot_id, "people_count": people_count})
             return None, "Недостатньо вільних місць"
 
         # 6. Create booking
@@ -141,9 +148,11 @@ async def create_booking(
             .options(joinedload(Booking.slot), joinedload(Booking.user))
             .where(Booking.id == new_booking.id)
         )
+        logger.info("booking_created", extra={"booking_id": new_booking.id, "user_id": user_id, "slot_id": slot_id, "location": slot.location_code})
         return reloaded_booking.scalar_one(), "OK"
 
     except Exception as e:
+        logger.exception("booking_creation_failed", extra={"user_id": user_id, "slot_id": slot_id})
         await session.rollback()
         return None, f"Помилка створення запису: {e}"
 
@@ -201,6 +210,8 @@ async def cancel_booking(
     if telegram_id is None:
         telegram_id = user_telegram_id
 
+    logger.info("booking_cancel_started", extra={"booking_id": booking_id, "telegram_id": telegram_id, "is_admin": is_admin})
+
     try:
         q = (
             select(Booking)
@@ -226,6 +237,7 @@ async def cancel_booking(
                 owner_tg_id = telegram_id
 
             if owner_tg_id != telegram_id:
+                logger.warning("booking_cancel_blocked_not_owner", extra={"booking_id": booking_id, "telegram_id": telegram_id})
                 return False, "Це не ваше бронювання"
 
         # Check status
@@ -242,7 +254,7 @@ async def cancel_booking(
             try:
                 await asyncio.to_thread(delete_event, booking.calendar_event_id)
             except Exception as e:
-                print(f"Calendar delete error: {e}")
+                logger.exception("calendar_event_delete_failed", extra={"calendar_event_id": booking.calendar_event_id}, exc_info=e)
 
         # Atomic decrement
         if booking.slot:
@@ -256,9 +268,11 @@ async def cancel_booking(
             await session.execute(stmt)
 
         await session.commit()
+        logger.info("booking_canceled", extra={"booking_id": booking_id})
         return True, "Скасовано успішно"
 
     except Exception as e:
+        logger.exception("booking_cancel_failed", extra={"booking_id": booking_id})
         await session.rollback()
         return False, f"Помилка скасування: {e}"
 
