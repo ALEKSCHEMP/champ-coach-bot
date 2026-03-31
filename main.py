@@ -46,7 +46,7 @@ if not BOT_TOKEN:
 engine = create_async_engine(DATABASE_URL, echo=False)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
-async def ensure_columns():
+async def ensure_columns(engine):
     async with engine.begin() as conn:
         # Check if columns exist in 'slots' table
         columns = await conn.run_sync(
@@ -113,7 +113,7 @@ async def ensure_columns():
         
         if "people_count" not in booking_col_names:
             await conn.execute(
-                text("ALTER TABLE bookings ADD COLUMN people_count INTEGER DEFAULT 1")
+                text("ALTER TABLE bookings ADD COLUMN people_count INTEGER NOT NULL DEFAULT 1")
             )    
             
         user_columns = await conn.run_sync(
@@ -123,14 +123,14 @@ async def ensure_columns():
         
         if "weekly_reminder_enabled" not in user_col_names:
             await conn.execute(
-                text("ALTER TABLE users ADD COLUMN weekly_reminder_enabled BOOLEAN DEFAULT 0")
+                text("ALTER TABLE users ADD COLUMN weekly_reminder_enabled BOOLEAN NOT NULL DEFAULT 1")
             )
             
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
-    await ensure_columns()
+    await ensure_columns(engine)
 
     # Створюємо 2 локації один раз
     async with SessionLocal() as session:
@@ -2804,10 +2804,42 @@ async def add_schedule_wd(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(RecurringTemplateStates.choosing_location, F.data.startswith("rec_loc:"))
 async def add_schedule_loc(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    await state.update_data(rec_loc=LOCATIONS[callback.data.split(":")[1]])
+    
+    loc_val = LOCATIONS[callback.data.split(":")[1]]
+    await state.update_data(rec_loc=loc_val)
+    
+    data = await state.get_data()
+    rec_wd = data.get("rec_wd", 0)
+    
+    # Python weekday (Mon=0, Sun=6) to SQLite %w (Sun=0, Mon=1, ..., Sat=6)
+    sqlite_wd = str((rec_wd + 1) % 7)
+    now = datetime.now()
+    
+    async with SessionLocal() as session:
+        q = (
+            select(func.strftime('%H:%M', Slot.start_time))
+            .where(Slot.location_code == loc_val)
+            .where(func.strftime('%w', Slot.start_time) == sqlite_wd)
+            .where(Slot.booked_count < Slot.capacity)
+            .where(Slot.start_time >= now)
+            .distinct()
+            .order_by(func.strftime('%H:%M', Slot.start_time))
+        )
+        times = (await session.execute(q)).scalars().all()
+
+    if not times:
+        await callback.message.edit_text(
+            "На цей день немає доступних слотів",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ Назад до вибору дня", callback_data="add_schedule")],
+                [InlineKeyboardButton(text="❌ Скасувати", callback_data="my_schedule")]
+            ])
+        )
+        await state.set_state(RecurringTemplateStates.choosing_weekday)
+        return
+
     await state.set_state(RecurringTemplateStates.choosing_time)
     
-    times = [f"{h:02d}:{m:02d}" for h in range(8, 22) for m in (0, 30)]
     rows = []
     row = []
     for t in times:

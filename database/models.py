@@ -21,6 +21,7 @@ class User(Base):
     full_name: Mapped[str | None] = mapped_column(String, nullable=True)
     role: Mapped[str] = mapped_column(String, default="user") # user, admin
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    weekly_reminder_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     bookings: Mapped[list["Booking"]] = relationship("Booking", back_populates="user")
 
@@ -63,7 +64,7 @@ class Booking(Base):
     client_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
     confirmation_status: Mapped[str] = mapped_column(String, default="pending")
     
-    people_count: Mapped[int] = mapped_column(Integer, default=1)
+    people_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     
     calendar_event_id: Mapped[str | None] = mapped_column(String, nullable=True)
    
