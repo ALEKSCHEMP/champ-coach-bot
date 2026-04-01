@@ -184,6 +184,9 @@ class AdminImportWeekStates(StatesGroup):
     choosing_week = State()
     confirming = State()
 
+class AdminClientStates(StatesGroup):
+    searching = State()
+
 
 async def send_locations(target: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1747,7 +1750,7 @@ admin_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="➕ Додати слот"), KeyboardButton(text="📅 Слоти")],
         [KeyboardButton(text="⚡ Згенерувати тиждень")],
-        [KeyboardButton(text="📅 Записи на день")], 
+        [KeyboardButton(text="📅 Записи на день"), KeyboardButton(text="👥 Клієнти")], 
         [KeyboardButton(text="🔙 Головне меню")],
     ],
     resize_keyboard=True
@@ -3063,6 +3066,242 @@ async def reschedule_booking_cmd(callback: types.CallbackQuery, state: FSMContex
         await safe_edit_text(callback.message, "Немає доступних днів для запису.")
     await safe_callback_answer(callback)
 
+
+# ==========================================
+# ADMIN CRM: КЛІЄНТИ
+# ==========================================
+
+@dp.message(F.text == "👥 Клієнти")
+async def adm_clients_menu_cmd(message: Message, state: FSMContext):
+    if not is_admin_user(message.from_user): return
+    await state.clear()
+    logger.info("admin_clients_opened", extra={"admin_id": message.from_user.id})
+    await safe_answer_message(
+        message,
+        "👥 Меню управління клієнтами:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔎 Пошук клієнта", callback_data="adm_clients_search")],
+            [InlineKeyboardButton(text="📋 Усі клієнти", callback_data="adm_clients_page:0")]
+        ])
+    )
+
+@dp.callback_query(F.data.startswith("adm_clients_page:"))
+async def adm_clients_list_page(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    page = int(callback.data.split(":")[1])
+    logger.info("admin_clients_page_opened", extra={"page": page})
+    
+    async with SessionLocal() as session:
+        from services.user_service import get_users_page
+        users, total = await get_users_page(session, page=page, per_page=10)
+        
+    lines = [f"📋 <b>Усі клієнти</b> (всього: {total})\n"]
+    kb_rows = []
+    
+    for u in users:
+        name = u.full_name or u.username or f"ID {u.telegram_id}"
+        lines.append(f"• {name}")
+        kb_rows.append([InlineKeyboardButton(text=f"👤 {name}", callback_data=f"adm_client_card:{u.telegram_id}")])
+        
+    # pagination
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_clients_page:{page-1}"))
+    if (page + 1) * 10 < total:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_clients_page:{page+1}"))
+    if nav:
+        kb_rows.append(nav)
+        
+    kb_rows.append([InlineKeyboardButton(text="🔙 Меню клієнтів", callback_data="adm_clients_main")])
+    
+    body_text = "\n".join(lines) if len(lines) > 1 else "Клієнтів не знайдено."
+    await safe_edit_text(
+        callback.message,
+        text=body_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+        parse_mode="HTML"
+    )
+    await safe_callback_answer(callback)
+
+@dp.callback_query(F.data == "adm_clients_main")
+async def adm_clients_main_cb(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    await state.clear()
+    await safe_edit_text(
+        callback.message,
+        "👥 Меню управління клієнтами:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔎 Пошук клієнта", callback_data="adm_clients_search")],
+            [InlineKeyboardButton(text="📋 Усі клієнти", callback_data="adm_clients_page:0")]
+        ])
+    )
+    await safe_callback_answer(callback)
+
+@dp.callback_query(F.data == "adm_clients_search")
+async def adm_clients_search_start(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    logger.info("admin_client_search_started")
+    await state.set_state(AdminClientStates.searching)
+    await safe_edit_text(
+        callback.message,
+        "🔎 Введіть ім'я, username або Telegram ID клієнта для пошуку:\n\n<i>Надішліть текст у чат.</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Скасувати", callback_data="adm_clients_main")]
+        ]),
+        parse_mode="HTML"
+    )
+    await safe_callback_answer(callback)
+
+@dp.message(AdminClientStates.searching)
+async def adm_clients_search_process(message: Message, state: FSMContext):
+    if not is_admin_user(message.from_user): return
+    query = message.text.strip()
+    logger.info("admin_client_search_completed", extra={"query": query})
+    
+    async with SessionLocal() as session:
+        from services.user_service import search_users
+        users = await search_users(session, query, limit=20)
+        
+    if not users:
+        await safe_answer_message(
+            message,
+            f"❌ За запитом «{query}» нікого не знайдено.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔎 Спробувати ще", callback_data="adm_clients_search")],
+                [InlineKeyboardButton(text="🔙 Меню", callback_data="adm_clients_main")]
+            ])
+        )
+        return
+        
+    lines = [f"🔎 Результати пошуку: <b>{query}</b>\n"]
+    kb_rows = []
+    for u in users:
+        name = u.full_name or u.username or f"ID {u.telegram_id}"
+        lines.append(f"• {name}")
+        kb_rows.append([InlineKeyboardButton(text=f"👤 {name}", callback_data=f"adm_client_card:{u.telegram_id}")])
+        
+    kb_rows.append([InlineKeyboardButton(text="🔎 Новий пошук", callback_data="adm_clients_search")])
+    kb_rows.append([InlineKeyboardButton(text="🔙 Меню", callback_data="adm_clients_main")])
+    
+    await safe_answer_message(
+        message,
+        text="\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data.startswith("adm_client_card:"))
+async def adm_client_card_view(callback: types.CallbackQuery):
+    if not is_admin_user(callback.from_user): return
+    target_tg_id = int(callback.data.split(":")[1])
+    logger.info("admin_client_card_opened", extra={"target_telegram_id": target_tg_id})
+    
+    async with SessionLocal() as session:
+        from services.user_service import get_user, get_user_stats
+        user = await get_user(session, target_tg_id)
+        if not user:
+            await safe_callback_answer(callback, "❌ Користувача не знайдено", show_alert=True)
+            return
+            
+        stats = await get_user_stats(session, user.id)
+        
+    lines = [
+        f"👤 <b>КАРТКА КЛІЄНТА</b>",
+        f"<b>Ім'я:</b> {user.full_name or '—'}",
+        f"<b>Username:</b> @{user.username}" if user.username else "<b>Username:</b> —",
+        f"<b>Telegram ID:</b> {user.telegram_id}",
+        "",
+        f"📊 <b>Статистика записів</b>",
+        f"• Всього: {stats['total']}",
+        f"• Активних: {stats['active']}",
+        f"• Скасованих: {stats['canceled']}",
+    ]
+    
+    if stats['loc_stats']:
+        lines.append("\n📍 <b>По локаціях:</b>")
+        for loc, count in stats['loc_stats'].items():
+            lines.append(f"• {loc}: {count}\n")
+            
+    if stats['nearest']:
+        b = stats['nearest']
+        start_t = b.slot.start_time if b.slot else b.booking_date
+        loc_t = b.location
+        lines.append(f"\n🔜 <b>Найближчий запис:</b>")
+        lines.append(f"📅 {start_t.strftime('%d.%m')} • {start_t.strftime('%H:%M')} • {loc_t}")
+        
+    if stats['last_past']:
+        b = stats['last_past']
+        start_t = b.slot.start_time if b.slot else b.booking_date
+        loc_t = b.location
+        lines.append(f"\n🔙 <b>Останній (в минулому):</b>")
+        lines.append(f"📅 {start_t.strftime('%d.%m')} • {start_t.strftime('%H:%M')} • {loc_t}")
+        
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📌 Активні записи", callback_data=f"adm_cli_act:{user.id}:0")],
+        [InlineKeyboardButton(text="📖 Історія записів", callback_data=f"adm_cli_hist:{user.id}:0")],
+        [InlineKeyboardButton(text="🔙 Усі клієнти", callback_data="adm_clients_page:0")]
+    ])
+    
+    await safe_edit_text(callback.message, "\n".join(lines).replace("\n\n\n", "\n\n"), reply_markup=kb, parse_mode="HTML")
+    await safe_callback_answer(callback)
+
+@dp.callback_query(F.data.startswith("adm_cli_act:") | F.data.startswith("adm_cli_hist:"))
+async def adm_client_bookings_view(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    action, user_id_str, page_str = callback.data.split(":")
+    u_id = int(user_id_str)
+    page = int(page_str)
+    
+    is_active_only = (action == "adm_cli_act")
+    logger.info("admin_client_active_bookings_opened" if is_active_only else "admin_client_history_opened", extra={"target_user_id": u_id, "page": page})
+    
+    async with SessionLocal() as session:
+        from services.booking_service import get_user_bookings_admin
+        from database.models import User
+        u_q = await session.execute(select(User).where(User.id == u_id))
+        user = u_q.scalar_one_or_none()
+        if not user:
+            await safe_callback_answer(callback, "Користувач не знайдений", show_alert=True)
+            return
+            
+        bookings = await get_user_bookings_admin(session, u_id)
+        
+    if is_active_only:
+        bookings = [b for b in bookings if b.status == "active"]
+        
+    per_page = 5
+    total = len(bookings)
+    page_items = bookings[page*per_page : (page+1)*per_page]
+    
+    title = "📌 Активні записи" if is_active_only else "📖 Історія записів"
+    
+    lines = [f"{title} клієнта <b>{user.full_name or user.username or ''}</b>:\n"]
+    if not page_items:
+        lines.append("Записів не знайдено.")
+    else:
+        for b in page_items:
+            st = "✅" if b.status == "active" else "❌"
+            dt = b.slot.start_time.strftime('%d.%m.%Y %H:%M') if b.slot else b.booking_date.strftime('%d.%m.%Y %H:%M')
+            lines.append(f"{st} <b>{dt}</b>")
+            lines.append(f"   📍 {b.location} | 👥 {b.people_count} | 🆔 {b.id}")
+            lines.append("")
+            
+    kb_rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"{action}:{u_id}:{page-1}"))
+    if (page + 1) * per_page < total:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"{action}:{u_id}:{page+1}"))
+    if nav:
+        kb_rows.append(nav)
+        
+    kb_rows.append([InlineKeyboardButton(text="🔙 Картка клієнта", callback_data=f"adm_client_card:{user.telegram_id}")])
+    
+    await safe_edit_text(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="HTML")
+    await safe_callback_answer(callback)
+
+
+
 @dp.message()
 async def fallback(message: Message):
     await safe_answer_message(message, 
@@ -3088,4 +3327,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
