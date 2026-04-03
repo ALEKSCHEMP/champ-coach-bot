@@ -69,6 +69,10 @@ async def get_user_stats(session: AsyncSession, user_id: int) -> dict:
     active = [b for b in bookings if b.status == "active"]
     canceled = [b for b in bookings if b.status == "canceled"]
     
+    visited_count = sum(1 for b in bookings if getattr(b, "attendance", None) == "visited")
+    no_show_count = sum(1 for b in bookings if getattr(b, "attendance", None) == "no_show")
+    rescheduled_count = sum(1 for b in bookings if getattr(b, "attendance", None) == "rescheduled")
+    
     loc_stats = {}
     for b in active:
         loc_stats[b.location] = loc_stats.get(b.location, 0) + 1
@@ -86,8 +90,68 @@ async def get_user_stats(session: AsyncSession, user_id: int) -> dict:
         "total": total,
         "active": len(active),
         "canceled": len(canceled),
+        "visited_count": visited_count,
+        "no_show_count": no_show_count,
+        "rescheduled_count": rescheduled_count,
         "last_booking_date": last_booking_date,
         "loc_stats": loc_stats,
         "nearest": future[0] if future else None,
         "last_past": past[0] if past else None
     }
+
+async def get_clients_overall_stats(session: AsyncSession) -> dict:
+    from sqlalchemy import select, func
+    from datetime import timedelta
+    
+    total_users = (await session.execute(select(func.count(User.id)))).scalar() or 0
+    
+    q = select(Booking).options(joinedload(Booking.slot))
+    bookings = (await session.execute(q)).scalars().all()
+    
+    total_bookings = len(bookings)
+    active_bookings = sum(1 for b in bookings if b.status == "active")
+    canceled_bookings = sum(1 for b in bookings if b.status == "canceled")
+    
+    visited_count = sum(1 for b in bookings if getattr(b, "attendance", None) == "visited")
+    no_show_count = sum(1 for b in bookings if getattr(b, "attendance", None) == "no_show")
+    rescheduled_count = sum(1 for b in bookings if getattr(b, "attendance", None) == "rescheduled")
+    
+    now = datetime.now()
+    today_date = now.date()
+    tomorrow_date = today_date + timedelta(days=1)
+    
+    no_attendance_count = 0
+    upcoming_today = 0
+    upcoming_tomorrow = 0
+    loc_stats = {}
+    
+    for b in bookings:
+        if b.status == "active":
+            b_time = b.slot.start_time if getattr(b, "slot", None) else b.booking_date
+            
+            # Count past records that haven't been resolved with attendance
+            if b_time < now and getattr(b, "attendance", None) is None:
+                no_attendance_count += 1
+                
+            # Count upcoming records that are active
+            if b_time.date() == today_date and b_time >= now:
+                upcoming_today += 1
+            elif b_time.date() == tomorrow_date:
+                upcoming_tomorrow += 1
+                
+            loc_stats[b.location] = loc_stats.get(b.location, 0) + 1
+                
+    return {
+        "total_users": total_users,
+        "total_bookings": total_bookings,
+        "active_bookings": active_bookings,
+        "canceled_bookings": canceled_bookings,
+        "visited_count": visited_count,
+        "no_show_count": no_show_count,
+        "rescheduled_count": rescheduled_count,
+        "no_attendance_count": no_attendance_count,
+        "bookings_by_location": loc_stats,
+        "upcoming_today": upcoming_today,
+        "upcoming_tomorrow": upcoming_tomorrow,
+    }
+

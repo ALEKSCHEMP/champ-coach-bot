@@ -54,6 +54,7 @@ class Booking(Base):
     location: Mapped[str] = mapped_column(String)
     
     status: Mapped[str] = mapped_column(String, default="active") # active, canceled
+    attendance: Mapped[str | None] = mapped_column(String, nullable=True) # visited, no_show, rescheduled
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     reminder_24h_sent: Mapped[bool] = mapped_column(Boolean, default=False)

@@ -120,6 +120,11 @@ async def ensure_columns(engine):
                 text("ALTER TABLE bookings ADD COLUMN people_count INTEGER NOT NULL DEFAULT 1")
             )    
             
+        if "attendance" not in booking_col_names:
+            await conn.execute(
+                text("ALTER TABLE bookings ADD COLUMN attendance TEXT NULL")
+            )
+            
         user_columns = await conn.run_sync(
             lambda sync_conn: sync_conn.execute(text("PRAGMA table_info(users)")).fetchall()
         )
@@ -688,6 +693,48 @@ async def weekly_reminder_iteration(bot: Bot):
         if checked > 0:
             logger.info(f"weekly_reminder_iteration finished: checked={checked} sent={sent} failed={failed}")
 
+async def attendance_auto_iteration(bot: Bot):
+    now = datetime.now()
+    async with SessionLocal() as session:
+        q = (
+            select(Booking)
+            .where(
+                Booking.status == "active",
+                Booking.attendance == None, # Need to be exactly None
+                Booking.booking_date <= now - timedelta(hours=2)
+            )
+        )
+        bookings = (await session.execute(q)).scalars().all()
+        
+        checked = len(bookings)
+        marked = 0
+        failed = 0
+        changed = False
+
+        if checked > 0:
+            logger.info("attendance_auto_iteration_started", extra={"checked": checked})
+
+        for b in bookings:
+            try:
+                b.attendance = "visited"
+                changed = True
+                marked += 1
+                logger.info("attendance_auto_marked_visited", extra={
+                    "booking_id": b.id, 
+                    "user_id": b.user_id, 
+                    "slot_id": b.slot_id, 
+                    "booking_date": b.booking_date.isoformat() if b.booking_date else None
+                })
+            except Exception:
+                failed += 1
+                logger.exception("attendance_auto_iteration_failed", extra={"booking_id": b.id})
+
+        if changed:
+            await session.commit()
+
+        if checked > 0:
+            logger.info("attendance_auto_iteration_finished", extra={"checked": checked, "marked": marked, "failed": failed})
+
 async def reminder_worker(bot: Bot):
     logger.info("reminder_worker started")
     while True:
@@ -707,6 +754,11 @@ async def reminder_worker(bot: Bot):
             await weekly_reminder_iteration(bot)
         except Exception:
             logger.exception("weekly_reminder_iteration failed")
+            
+        try:
+            await attendance_auto_iteration(bot)
+        except Exception:
+            logger.exception("attendance_auto_iteration failed")
 
         await asyncio.sleep(60)
 
@@ -1905,7 +1957,10 @@ async def confirm_booking(callback: types.CallbackQuery, state: FSMContext):
             )
             if booking:
                 success, c_msg = await cancel_booking(session, reschedule_id, telegram_id=callback.from_user.id)
-                if not success:
+                if success:
+                    old_booking.attendance = "rescheduled"
+                    await session.commit()
+                else:
                     logging.error(f"Post-reschedule cancellation failed for booking {reschedule_id}: {c_msg}")
         else:
             booking, msg = await create_booking(
@@ -3081,7 +3136,9 @@ async def adm_clients_menu_cmd(message: Message, state: FSMContext):
         "👥 Меню управління клієнтами:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔎 Пошук клієнта", callback_data="adm_clients_search")],
-            [InlineKeyboardButton(text="📋 Усі клієнти", callback_data="adm_clients_page:0")]
+            [InlineKeyboardButton(text="📋 Усі клієнти", callback_data="adm_clients_page:0")],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_clients_stats")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main_menu_cb")]
         ])
     )
 
@@ -3132,9 +3189,64 @@ async def adm_clients_main_cb(callback: types.CallbackQuery, state: FSMContext):
         "👥 Меню управління клієнтами:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔎 Пошук клієнта", callback_data="adm_clients_search")],
-            [InlineKeyboardButton(text="📋 Усі клієнти", callback_data="adm_clients_page:0")]
+            [InlineKeyboardButton(text="📋 Усі клієнти", callback_data="adm_clients_page:0")],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_clients_stats")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main_menu_cb")]
         ])
     )
+    await safe_callback_answer(callback)
+
+@dp.callback_query(F.data == "adm_main_menu_cb")
+async def adm_main_menu_cb(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    await state.clear()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await safe_answer_message(callback.message, "Адмін-панель 👇", reply_markup=admin_kb)
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(F.data == "adm_clients_stats")
+async def adm_clients_stats_cb(callback: types.CallbackQuery):
+    if not is_admin_user(callback.from_user): return
+    logger.info("admin_clients_stats_opened")
+    await safe_edit_text(callback.message, "⏳ Генерую статистику...")
+    async with SessionLocal() as session:
+        from services.user_service import get_clients_overall_stats
+        s = await get_clients_overall_stats(session)
+    
+    lines = [
+        "📊 <b>Статистика клієнтів</b>\n",
+        f"👥 Усього клієнтів: {s['total_users']}\n",
+        f"📅 <b>Записи:</b>",
+        f"• Всього: {s['total_bookings']}",
+        f"• Активних: {s['active_bookings']}",
+        f"• Скасованих: {s['canceled_bookings']}\n",
+        f"✅ <b>Attendance:</b>",
+        f"• Відвідано: {s['visited_count']}",
+        f"• Не прийшли: {s['no_show_count']}",
+        f"• Перенесено: {s['rescheduled_count']}",
+        f"• Без статусу: {s['no_attendance_count']}\n",
+        f"📍 <b>По локаціях:</b>"
+    ]
+    if s['bookings_by_location']:
+        for loc, count in s['bookings_by_location'].items():
+            lines.append(f"• {loc}: {count}")
+    else:
+        lines.append("• Немає даних")
+        
+    lines.append("")
+    lines.append("🕒 <b>Активні записи:</b>")
+    lines.append(f"• Сьогодні: {s['upcoming_today']}")
+    lines.append(f"• Завтра: {s['upcoming_tomorrow']}")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_clients_main")]
+    ])
+    
+    await safe_edit_text(callback.message, "\n".join(lines), reply_markup=kb, parse_mode="HTML")
     await safe_callback_answer(callback)
 
 @dp.callback_query(F.data == "adm_clients_search")
@@ -3212,9 +3324,12 @@ async def adm_client_card_view(callback: types.CallbackQuery):
         f"<b>Telegram ID:</b> {user.telegram_id}",
         "",
         f"📊 <b>Статистика записів</b>",
-        f"• Всього: {stats['total']}",
+        f"• Всього записів: {stats['total']}",
         f"• Активних: {stats['active']}",
         f"• Скасованих: {stats['canceled']}",
+        f"• Відвідав: {stats.get('visited_count', 0)}",
+        f"• Не прийшов: {stats.get('no_show_count', 0)}",
+        f"• Перенесено: {stats.get('rescheduled_count', 0)}",
     ]
     
     if stats['loc_stats']:
@@ -3275,18 +3390,31 @@ async def adm_client_bookings_view(callback: types.CallbackQuery, state: FSMCont
     
     title = "📌 Активні записи" if is_active_only else "📖 Історія записів"
     
+    kb_rows = []
     lines = [f"{title} клієнта <b>{user.full_name or user.username or ''}</b>:\n"]
     if not page_items:
         lines.append("Записів не знайдено.")
     else:
         for b in page_items:
-            st = "✅" if b.status == "active" else "❌"
+            att = getattr(b, "attendance", None)
+            if att == "visited":
+                st = "✅"
+            elif att == "no_show":
+                st = "❌"
+            elif att == "rescheduled":
+                st = "🔁"
+            else:
+                st = "📌" if b.status == "active" else "🚫"
+                
             dt = b.slot.start_time.strftime('%d.%m.%Y %H:%M') if b.slot else b.booking_date.strftime('%d.%m.%Y %H:%M')
             lines.append(f"{st} <b>{dt}</b>")
             lines.append(f"   📍 {b.location} | 👥 {b.people_count} | 🆔 {b.id}")
             lines.append("")
             
-    kb_rows = []
+            kb_rows.append([
+                InlineKeyboardButton(text=f"📝 Запис #{b.id}", callback_data=f"adm_b_edit:{b.id}")
+            ])
+            
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"{action}:{u_id}:{page-1}"))
@@ -3300,6 +3428,65 @@ async def adm_client_bookings_view(callback: types.CallbackQuery, state: FSMCont
     await safe_edit_text(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="HTML")
     await safe_callback_answer(callback)
 
+
+@dp.callback_query(F.data.startswith("adm_b_edit:"))
+async def adm_b_edit_view(callback: types.CallbackQuery):
+    if not is_admin_user(callback.from_user): return
+    b_id = int(callback.data.split(":")[1])
+    async with SessionLocal() as session:
+        b = await session.get(Booking, b_id)
+        if not b:
+             await safe_callback_answer(callback, "Запис не знайдено", show_alert=True)
+             return
+             
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Відвідав", callback_data=f"adm_att:{b.id}:visited")],
+        [InlineKeyboardButton(text="❌ Не прийшов", callback_data=f"adm_att:{b.id}:no_show")],
+        [InlineKeyboardButton(text="♻️ Скинути статус", callback_data=f"adm_att:{b.id}:clear")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"adm_cli_act:{b.user_id}:0")]
+    ])
+    
+    st_val = getattr(b, "attendance", None)
+    if st_val == "visited": st = "✅"
+    elif st_val == "no_show": st = "❌"
+    elif st_val == "rescheduled": st = "🔁"
+    else: st = "📌" if b.status == "active" else "🚫"
+    
+    text = (f"📝 <b>Керування записом #{b.id}</b>\n\n"
+            f"Статус: {st}\n"
+            f"Системний статус: {b.status}\n"
+            f"Локація: {b.location}\n"
+            f"Осіб: {b.people_count}")
+            
+    await safe_edit_text(callback.message, text, reply_markup=kb, parse_mode="HTML")
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(F.data.startswith("adm_att:"))
+async def adm_att_mark(callback: types.CallbackQuery):
+    if not is_admin_user(callback.from_user): return
+    _, b_id_str, status = callback.data.split(":")
+    b_id = int(b_id_str)
+    
+    async with SessionLocal() as session:
+        b = await session.get(Booking, b_id)
+        if not b:
+             await safe_callback_answer(callback, "Запис не знайдено", show_alert=True)
+             return
+             
+        if status == "clear":
+            b.attendance = None
+            logging.info("booking_attendance_cleared", extra={"booking_id": b.id})
+        elif status == "visited":
+            b.attendance = "visited"
+            logging.info("booking_marked_visited", extra={"booking_id": b.id})
+        elif status == "no_show":
+            b.attendance = "no_show"
+            logging.info("booking_marked_no_show", extra={"booking_id": b.id})
+            
+        await session.commit()
+    
+    await adm_b_edit_view(callback)
 
 
 @dp.message()
