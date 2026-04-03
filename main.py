@@ -620,15 +620,26 @@ async def post_workout_iteration(bot: Bot):
             try:
                 # 3. Post-workout offer
                 if (not getattr(b, "post_workout_offer_sent", False) and b.slot.start_time < now - timedelta(minutes=90)):
-                    await safe_send_message(bot, 
-                        b.user.telegram_id,
-                        POST_WORKOUT_TEXT,
-                        reply_markup=post_workout_rebook_kb(b.id)
-                    )
-                    b.post_workout_offer_sent = True
-                    changed = True
-                    sent += 1
-                    logger.info(f"Post-workout offer sent for booking_id={b.id}")
+                    from services.booking_service import has_future_booking_this_week
+                    logger.info("post_workout_offer_check_started", extra={"booking_id": b.id, "user_id": b.user_id})
+                    
+                    has_future = await has_future_booking_this_week(session, b.user_id, b.slot.start_time)
+                    
+                    if has_future:
+                        logger.info("post_workout_offer_skipped_has_future_booking_this_week", extra={"booking_id": b.id, "user_id": b.user_id})
+                        # Still flag as evaluated so it skips next time
+                        b.post_workout_offer_sent = True
+                        changed = True
+                    else:
+                        await safe_send_message(bot, 
+                            b.user.telegram_id,
+                            POST_WORKOUT_TEXT,
+                            reply_markup=post_workout_rebook_kb(b.id)
+                        )
+                        b.post_workout_offer_sent = True
+                        changed = True
+                        sent += 1
+                        logger.info("post_workout_offer_sent", extra={"booking_id": b.id, "user_id": b.user_id})
             except Exception:
                 failed += 1
                 logger.exception("failed to process booking in post_workout_iteration", extra={"booking_id": b.id, "user_id": b.user_id, "slot_id": b.slot_id})
@@ -3487,6 +3498,84 @@ async def adm_att_mark(callback: types.CallbackQuery):
         await session.commit()
     
     await adm_b_edit_view(callback)
+
+
+from aiogram.filters import Command
+
+@dp.message(Command("test_post_workout_logic"))
+async def test_post_workout_logic_cmd(message: Message):
+    if not is_admin_user(message.from_user): return
+    logger.info("post_workout_logic_test_requested")
+    
+    async with SessionLocal() as session:
+        from services.booking_service import has_future_booking_this_week
+        from sqlalchemy import select, desc
+        from sqlalchemy.orm import joinedload
+        from database.models import User, Booking, Slot
+        
+        u = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+        user = u.scalar_one_or_none()
+        if not user:
+            await safe_answer_message(message, "Admin user not found in DB.")
+            return
+
+        now = datetime.now()
+        # Find the most recent strictly past active booking
+        q_past = (
+            select(Booking)
+            .join(Slot, Booking.slot_id == Slot.id)
+            .where(Booking.user_id == user.id, Booking.status == "active", Slot.start_time < now)
+            .order_by(desc(Slot.start_time))
+            .limit(1)
+            .options(joinedload(Booking.slot))
+        )
+        past_booking = (await session.execute(q_past)).scalar_one_or_none()
+
+        if not past_booking:
+            await safe_answer_message(message, "Не знайдено жодного минулого запису для тесту.")
+            return
+
+        current_booking_date = past_booking.slot.start_time
+        has_future = await has_future_booking_this_week(session, user.id, current_booking_date)
+        
+        days_to_sunday = 6 - current_booking_date.weekday()
+        end_of_week = current_booking_date.replace(hour=23, minute=59, second=59) + timedelta(days=days_to_sunday)
+        
+        future_booking_info = "None"
+        if has_future:
+            q_future = (
+                select(Booking)
+                .join(Slot, Booking.slot_id == Slot.id)
+                .where(
+                    Booking.user_id == user.id,
+                    Booking.status == "active",
+                    Slot.start_time > current_booking_date,
+                    Slot.start_time <= end_of_week
+                )
+                .order_by(Slot.start_time)
+                .limit(1)
+                .options(joinedload(Booking.slot))
+            )
+            fb = (await session.execute(q_future)).scalar_one_or_none()
+            if fb:
+                future_booking_info = f"Booking ID: {fb.id}, Date: {fb.slot.start_time.strftime('%Y-%m-%d %H:%M')}"
+        
+        report = (
+            f"🛠 <b>Post-Workout Anti-Spam Debug Report</b>\n\n"
+            f"Тестовий запис (останній минулий):\n"
+            f"ID: {past_booking.id}\n"
+            f"Дата: {current_booking_date.strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"Чи є майбутні записи на цьому тижні: {'YES' if has_future else 'NO'}\n"
+        )
+        
+        if has_future:
+            report += f"Майбутній запис: {future_booking_info}\n\n"
+            report += "🛑 Ітог: offer should be skipped"
+        else:
+            report += "\n✅ Ітог: offer should be sent"
+            
+        await safe_answer_message(message, report, parse_mode="HTML")
+        logger.info("post_workout_logic_test_completed")
 
 
 @dp.message()

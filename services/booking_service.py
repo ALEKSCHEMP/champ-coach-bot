@@ -334,3 +334,26 @@ async def get_user_bookings_admin(session: AsyncSession, user_id: int) -> list[B
     
     result = await session.execute(q)
     return result.scalars().unique().all()
+
+
+async def has_future_booking_this_week(session: AsyncSession, user_id: int, current_booking_date: datetime) -> bool:
+    """
+    Checks if there's any active booking for the user in the same calendar week, strictly AFTER the current booking_date.
+    Monday is 0, Sunday is 6. End of week is Sunday 23:59:59.
+    """
+    days_to_sunday = 6 - current_booking_date.weekday()
+    end_of_week = current_booking_date.replace(hour=23, minute=59, second=59) + timedelta(days=days_to_sunday)
+    
+    q = (
+        select(Booking)
+        .join(Slot, Booking.slot_id == Slot.id)
+        .where(
+            Booking.user_id == user_id,
+            Booking.status == "active",
+            Slot.start_time > current_booking_date,
+            Slot.start_time <= end_of_week
+        )
+        .limit(1)
+    )
+    result = await session.execute(q)
+    return result.scalar_one_or_none() is not None
