@@ -1628,6 +1628,9 @@ async def rebook_same_handler(callback: types.CallbackQuery):
 
         slot_time_str = next_slot.start_time.strftime("%d.%m о %H:%M")
 
+        # Створюємо подію в Google Calendar асинхронно у фоні (не блокуємо потік)
+        asyncio.create_task(safe_create_calendar_event_for_booking(new_booking.id))
+
         await safe_callback_answer(callback, "Готово 💪")
         await safe_edit_text(callback.message, 
             f"✅ Тебе записано на наступне тренування:\n{slot_time_str}"
@@ -1918,6 +1921,43 @@ async def sync_calendar_future(message: Message):
         f"Помилок: {failed_count}"
     )   
 
+async def safe_create_calendar_event_for_booking(booking_id: int):
+    try:
+        async with SessionLocal() as session:
+            q = select(Booking).options(joinedload(Booking.user), joinedload(Booking.slot)).where(Booking.id == booking_id)
+            booking = (await session.execute(q)).scalar_one_or_none()
+            if not booking or not booking.slot:
+                logger.warning(f"calendar_background_failed: booking or slot not found for id {booking_id}")
+                return
+
+            slot_time = booking.slot.start_time
+            end_time = booking.slot.end_time
+            
+            client_name = "Клієнт"
+            tg_username = "—"
+            if booking.user:
+                client_name = booking.user.full_name or booking.user.username or "Клієнт"
+                tg_username = booking.user.username or "—"
+            
+            location_name = booking.location
+
+            event_id = await safe_create_calendar_event(
+                summary=f"🏋️ Тренування — {client_name}",
+                description=(
+                    f"Клієнт: {client_name}\n"
+                    f"Telegram: @{tg_username}\n"
+                    f"Локація: {location_name}"
+                ),
+                start_dt=slot_time,
+                end_dt=end_time
+            )
+
+            if event_id:
+                booking.calendar_event_id = event_id
+                await session.commit()
+    except Exception as e:
+        logger.exception(f"calendar_background_failed: {e}")
+
 @dp.callback_query(F.data == "confirm_booking")
 async def confirm_booking(callback: types.CallbackQuery, state: FSMContext):
     # СРАЗУ закрываем callback, чтобы Telegram не считал его просроченным
@@ -1990,37 +2030,8 @@ async def confirm_booking(callback: types.CallbackQuery, state: FSMContext):
     
     
     
-    # 2. Пытаемся создать событие в Google Calendar
-    try:
-        slot_time = booking.booking_date
-        end_time = booking.slot.end_time if booking.slot else slot_time + timedelta(hours=1)
-
-        client_name = callback.from_user.full_name or callback.from_user.username or "Клієнт"
-        location_name = booking.location
-
-        event_id = await safe_create_calendar_event(
-            summary=f"🏋️ Тренування — {client_name}",
-            description=(
-                f"Клієнт: {client_name}\n"
-                f"Telegram: @{callback.from_user.username or '—'}\n"
-                f"Локація: {location_name}"
-            ),
-            start_dt=slot_time,
-            end_dt=end_time
-        )
-
-        if event_id:
-            async with SessionLocal() as session:
-                db_booking = await session.get(Booking, booking.id)
-                if db_booking:
-                    db_booking.calendar_event_id = event_id
-                    await session.commit()
-
-    except Exception as e:
-        logger.exception("calendar_sync_failed", exc_info=e)
-        await safe_answer_message(callback.message, 
-        "⚠️ Запис створено, але подію в Google Calendar не вдалося додати."
-    )
+    # 2. Створюємо подію в Google Calendar асинхронно у фоні (не блокуємо потік)
+    asyncio.create_task(safe_create_calendar_event_for_booking(booking.id))
 
     # 3. Отвечаем пользователю
     user = callback.from_user
