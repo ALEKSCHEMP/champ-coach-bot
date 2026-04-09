@@ -2,6 +2,19 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+def now_kyiv() -> datetime:
+    return datetime.now(KYIV_TZ)
+
+def as_kyiv(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=KYIV_TZ)
+    return dt.astimezone(KYIV_TZ)
 
 
 from dotenv import load_dotenv
@@ -43,7 +56,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 logging.info(f"ADMIN_ID={ADMIN_ID}")
-DATABASE_URL = "sqlite+aiosqlite:////Users/admin/alekschamp_bot/champ.db"                                    
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./champ.db")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN not found. Put it into .env file")
 
@@ -502,6 +515,7 @@ def is_admin_user(user: types.User | None) -> bool:
     return ADMIN_ID != 0 and user is not None and user.id == ADMIN_ID
 
 def fmt_dt(dt: datetime) -> str:
+    dt = as_kyiv(dt)
     return dt.strftime("%Y-%m-%d %H:%M")
 
 # Доступні локації (ключ — для команд, значення — для відображення)
@@ -513,7 +527,8 @@ LOCATIONS = {
 logger = logging.getLogger(__name__)
 
 async def reminder_iteration(bot: Bot):
-    now = datetime.now()
+    now = now_kyiv()
+    now_naive = now.replace(tzinfo=None)
     async with SessionLocal() as session:
         q = (
             select(Booking)
@@ -521,7 +536,7 @@ async def reminder_iteration(bot: Bot):
             .options(joinedload(Booking.slot), joinedload(Booking.user))
             .where(
                 Booking.status == "active",
-                Slot.start_time > now - timedelta(days=1)
+                Slot.start_time > now_naive - timedelta(days=1)
             )
         )
         bookings = (await session.execute(q)).scalars().unique().all()
@@ -535,7 +550,7 @@ async def reminder_iteration(bot: Bot):
             if not b.user or not b.slot:
                 continue
 
-            slot_time = b.slot.start_time
+            slot_time = as_kyiv(b.slot.start_time)
             time_to_training = slot_time - now
             
             try:
@@ -544,7 +559,7 @@ async def reminder_iteration(bot: Bot):
                     confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
                         [InlineKeyboardButton(text="✅ Буду", callback_data=f"confirm_yes:{b.id}"),
                          InlineKeyboardButton(text="❌ Не прийду", callback_data=f"confirm_no:{b.id}")],
-                        [InlineKeyboardButton(text="🔁 Перенести", callback_data=f"reschedule_start:{b.id}")]
+                        [InlineKeyboardButton(text="🔁 Перенести", callback_data=f"reschedule:{b.id}")]
                     ])
                     await safe_send_message(bot, 
                         b.user.telegram_id,
@@ -595,7 +610,8 @@ async def reminder_iteration(bot: Bot):
         logger.info(f"reminder_iteration finished: checked={checked} sent={sent} failed={failed}")
 
 async def post_workout_iteration(bot: Bot):
-    now = datetime.now()
+    now = now_kyiv()
+    now_naive = now.replace(tzinfo=None)
     async with SessionLocal() as session:
         q = (
             select(Booking)
@@ -603,7 +619,7 @@ async def post_workout_iteration(bot: Bot):
             .options(joinedload(Booking.slot), joinedload(Booking.user))
             .where(
                 Booking.status == "active",
-                Slot.start_time > now - timedelta(days=1)
+                Slot.start_time > now_naive - timedelta(days=1)
             )
         )
         bookings = (await session.execute(q)).scalars().unique().all()
@@ -619,7 +635,7 @@ async def post_workout_iteration(bot: Bot):
 
             try:
                 # 3. Post-workout offer
-                if (not getattr(b, "post_workout_offer_sent", False) and b.slot.start_time < now - timedelta(minutes=90)):
+                if (not getattr(b, "post_workout_offer_sent", False) and as_kyiv(b.slot.start_time) < now - timedelta(minutes=90)):
                     from services.booking_service import has_future_booking_this_week
                     logger.info("post_workout_offer_check_started", extra={"booking_id": b.id, "user_id": b.user_id})
                     
@@ -650,7 +666,7 @@ async def post_workout_iteration(bot: Bot):
         logger.info(f"post_workout_iteration finished: checked={checked} sent={sent} failed={failed}")
 
 async def weekly_reminder_iteration(bot: Bot):
-    now = datetime.now()
+    now = now_kyiv()
     if not (now.weekday() == 6 and 10 <= now.hour <= 20):
         return
 
@@ -705,14 +721,15 @@ async def weekly_reminder_iteration(bot: Bot):
             logger.info(f"weekly_reminder_iteration finished: checked={checked} sent={sent} failed={failed}")
 
 async def attendance_auto_iteration(bot: Bot):
-    now = datetime.now()
+    now = now_kyiv()
+    now_naive = now.replace(tzinfo=None)
     async with SessionLocal() as session:
         q = (
             select(Booking)
             .where(
                 Booking.status == "active",
                 Booking.attendance == None, # Need to be exactly None
-                Booking.booking_date <= now - timedelta(hours=2)
+                Booking.booking_date <= now_naive - timedelta(hours=2)
             )
         )
         bookings = (await session.execute(q)).scalars().all()
@@ -779,14 +796,16 @@ async def reminder_worker(bot: Bot):
 async def build_free_slots_kb(target_day: date, location_filter: str | None) -> InlineKeyboardMarkup | None:
     start = datetime.combine(target_day, datetime.min.time())
     end = start + timedelta(days=1)
-    now = datetime.now()
+    
+    now = now_kyiv()
+    now_naive = now.replace(tzinfo=None)
 
     async with SessionLocal() as session:
         q = (
             select(Slot)
             .where(Slot.booked_count < Slot.capacity) # ✅ Capacity check
             .where(Slot.start_time >= start, Slot.start_time < end)
-            .where(Slot.start_time >= now)
+            .where(Slot.start_time >= now_naive)
             .order_by(Slot.location_code, Slot.start_time)
         )
 
@@ -1081,8 +1100,8 @@ def build_my_bookings_kb(bookings: list[Booking], mode: str = "active") -> Inlin
                     callback_data=f"my_cancel:{b.id}"
                 )
             ])
-            now = datetime.now()
-            if b.slot and b.slot.start_time > now + timedelta(hours=4):
+            now = now_kyiv()
+            if b.slot and as_kyiv(b.slot.start_time) > now + timedelta(hours=4):
                 rows.append([
                     InlineKeyboardButton(
                         text=f"🔄 Перенести тренування",
@@ -1189,7 +1208,8 @@ async def show_my_bookings(
     mode: str = "active"
 ):
     user = tg_user
-    now = datetime.now()
+    now = now_kyiv()
+    now_naive = now.replace(tzinfo=None)
 
     async with SessionLocal() as session:
         db_user = await session.scalar(
@@ -1214,12 +1234,12 @@ async def show_my_bookings(
 
         if mode == "active":
             q = (
-                q.where(and_(Booking.status == "active", Slot.start_time >= now))
+                q.where(and_(Booking.status == "active", Slot.start_time >= now_naive))
                  .order_by(Slot.start_time.asc())
             )
         else:
             q = (
-                q.where(or_(Booking.status != "active", Slot.start_time < now))
+                q.where(or_(Booking.status != "active", Slot.start_time < now_naive))
                  .order_by(Slot.start_time.desc())
             )
 
@@ -1856,7 +1876,8 @@ async def sync_calendar_future(message: Message):
         await safe_answer_message(message, "Немає доступу.")
         return
 
-    now = datetime.now()
+    now = now_kyiv()
+    now_naive = now.replace(tzinfo=None)
     created_count = 0
     skipped_count = 0
     failed_count = 0
@@ -1868,7 +1889,7 @@ async def sync_calendar_future(message: Message):
             .options(joinedload(Booking.slot), joinedload(Booking.user))
             .where(
                 Booking.status == "active",
-                Slot.start_time >= now
+                Slot.start_time >= now_naive
             )
             .order_by(Slot.start_time.asc())
         )
@@ -1993,7 +2014,7 @@ async def confirm_booking(callback: types.CallbackQuery, state: FSMContext):
                 await safe_answer_message(callback.message, "❌ Ти обрав той самий слот. Перенесення скасовано.")
                 await state.clear()
                 return
-            if old_booking.slot.start_time <= datetime.now() + timedelta(hours=4):
+            if as_kyiv(old_booking.slot.start_time) <= now_kyiv() + timedelta(hours=4):
                 await safe_answer_message(callback.message, "❌ Перенести тренування можна не пізніше ніж за 4 години до початку.")
                 await state.clear()
                 return
@@ -2646,16 +2667,17 @@ async def admin_client_bookings(callback: types.CallbackQuery):
 
     lines = [f"📌 Записи клієнта (ID:{user_id}):"]
     rows = []
-    now = datetime.now()
+    now = now_kyiv()
+    now_naive = now.replace(tzinfo=None)
 
     future_active = [
         b for b in bookings
-        if b.status == "active" and b.slot and b.slot.start_time >= now
+        if b.status == "active" and b.slot and b.slot.start_time >= now_naive
     ]
 
     past_active = [
         b for b in bookings
-        if b.status == "active" and b.slot and b.slot.start_time < now
+        if b.status == "active" and b.slot and b.slot.start_time < now_naive
     ]
 
     canceled = [
@@ -2908,9 +2930,9 @@ async def add_schedule_loc(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     rec_wd = data.get("rec_wd", 0)
     
-    # Python weekday (Mon=0, Sun=6) to SQLite %w (Sun=0, Mon=1, ..., Sat=6)
     sqlite_wd = str((rec_wd + 1) % 7)
-    now = datetime.now()
+    now = now_kyiv()
+    now_naive = now.replace(tzinfo=None)
     
     async with SessionLocal() as session:
         q = (
@@ -2918,7 +2940,7 @@ async def add_schedule_loc(callback: types.CallbackQuery, state: FSMContext):
             .where(Slot.location_code == loc_val)
             .where(func.strftime('%w', Slot.start_time) == sqlite_wd)
             .where(Slot.booked_count < Slot.capacity)
-            .where(Slot.start_time >= now)
+            .where(Slot.start_time >= now_naive)
             .distinct()
             .order_by(func.strftime('%H:%M', Slot.start_time))
         )
@@ -3026,7 +3048,7 @@ async def rebook_schedule_cmd(callback: types.CallbackQuery):
     await safe_callback_answer(callback)
     
     wd_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
-    now = datetime.now()
+    now = now_kyiv()
     today_date = now.date()
     
     async with SessionLocal() as session:
@@ -3124,7 +3146,7 @@ async def reschedule_booking_cmd(callback: types.CallbackQuery, state: FSMContex
             await safe_callback_answer(callback, "Помилка: слот старого запису пошкоджено", show_alert=True)
             return
             
-        if booking.slot.start_time <= datetime.now() + timedelta(hours=4):
+        if as_kyiv(booking.slot.start_time) <= now_kyiv() + timedelta(hours=4):
             await safe_callback_answer(callback, "Перенести тренування можна не пізніше ніж за 4 години до початку.", show_alert=True)
             return
 
@@ -3530,12 +3552,13 @@ async def test_post_workout_logic_cmd(message: Message):
             await safe_answer_message(message, "Admin user not found in DB.")
             return
 
-        now = datetime.now()
+        now = now_kyiv()
+        now_naive = now.replace(tzinfo=None)
         # Find the most recent strictly past active booking
         q_past = (
             select(Booking)
             .join(Slot, Booking.slot_id == Slot.id)
-            .where(Booking.user_id == user.id, Booking.status == "active", Slot.start_time < now)
+            .where(Booking.user_id == user.id, Booking.status == "active", Slot.start_time < now_naive)
             .order_by(desc(Slot.start_time))
             .limit(1)
             .options(joinedload(Booking.slot))

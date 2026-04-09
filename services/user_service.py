@@ -77,7 +77,9 @@ async def get_user_stats(session: AsyncSession, user_id: int) -> dict:
     for b in active:
         loc_stats[b.location] = loc_stats.get(b.location, 0) + 1
         
-    now = datetime.now()
+    from zoneinfo import ZoneInfo
+    now_kyiv = datetime.now(ZoneInfo("Europe/Kyiv"))
+    now = now_kyiv.replace(tzinfo=None)
     future = [b for b in active if b.slot and b.slot.start_time and b.slot.start_time >= now]
     past = [b for b in active if b.slot and b.slot.start_time and b.slot.start_time < now]
     
@@ -116,8 +118,10 @@ async def get_clients_overall_stats(session: AsyncSession) -> dict:
     no_show_count = sum(1 for b in bookings if getattr(b, "attendance", None) == "no_show")
     rescheduled_count = sum(1 for b in bookings if getattr(b, "attendance", None) == "rescheduled")
     
-    now = datetime.now()
-    today_date = now.date()
+    from zoneinfo import ZoneInfo
+    now_kyiv = datetime.now(ZoneInfo("Europe/Kyiv"))
+    now = now_kyiv.replace(tzinfo=None)
+    today_date = now_kyiv.date()
     tomorrow_date = today_date + timedelta(days=1)
     
     no_attendance_count = 0

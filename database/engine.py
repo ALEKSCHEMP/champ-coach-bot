@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy import text
 import os
 
-DATABASE_URL = "sqlite+aiosqlite:///champ.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./champ.db")
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 
