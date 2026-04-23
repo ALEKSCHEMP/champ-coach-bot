@@ -73,6 +73,19 @@ class Booking(Base):
     user: Mapped["User"] = relationship("User", back_populates="bookings")
     slot: Mapped["Slot"] = relationship("Slot", back_populates="bookings")
 
+class BookingReschedule(Base):
+    __tablename__ = "booking_reschedules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    booking_id: Mapped[int] = mapped_column(ForeignKey("bookings.id"), index=True)
+    old_slot_id: Mapped[int] = mapped_column(ForeignKey("slots.id"), index=True)
+    new_slot_id: Mapped[int] = mapped_column(ForeignKey("slots.id"), index=True)
+    changed_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    changed_by_role: Mapped[str] = mapped_column(String(20))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    booking: Mapped["Booking"] = relationship("Booking")
+
 class SlotTemplate(Base):
     __tablename__ = "slot_templates"
     

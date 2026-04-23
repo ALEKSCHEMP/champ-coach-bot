@@ -43,6 +43,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from services.telegram_wrappers import safe_send_message, safe_answer_message, safe_edit_text, safe_edit_reply_markup, safe_callback_answer
 from database.models import Base, Location, Slot, Booking, User, SlotTemplate, RecurringBookingTemplate, WeeklyScheduleReminderLog
 from services.booking_service import create_booking, cancel_booking, get_bookings_for_day, fix_legacy_booking_user_ids, get_or_create_user
+from services.reschedule_service import get_available_reschedule_dates, get_available_reschedule_slots, reschedule_booking
 from services.template_service import get_templates, create_template, delete_template, toggle_template, generate_week_slots
 from services.google_calendar import safe_create_calendar_event
 
@@ -204,6 +205,16 @@ class AdminImportWeekStates(StatesGroup):
 
 class AdminClientStates(StatesGroup):
     searching = State()
+
+class RescheduleStates(StatesGroup):
+    choosing_day = State()
+    choosing_slot = State()
+    confirming = State()
+
+class AdminRescheduleStates(StatesGroup):
+    choosing_day = State()
+    choosing_slot = State()
+    confirming = State()
 
 
 async def send_locations(target: Message):
@@ -1104,7 +1115,7 @@ def build_my_bookings_kb(bookings: list[Booking], mode: str = "active") -> Inlin
             if b.slot and as_kyiv(b.slot.start_time) > now + timedelta(hours=4):
                 rows.append([
                     InlineKeyboardButton(
-                        text=f"🔄 Перенести тренування",
+                        text=f"🔄 Перенести запис",
                         callback_data=f"reschedule:{b.id}"
                     )
                 ])
@@ -1175,6 +1186,97 @@ def build_admin_bookings_days_kb() -> InlineKeyboardMarkup:
 
     rows.append([InlineKeyboardButton(text="❌ Закрити", callback_data="admin_bookings_close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def slot_line(slot: Slot) -> str:
+    return f"📅 {fmt_dt(slot.start_time)} • 📍 {slot.location_code}"
+
+
+def booking_line(booking: Booking) -> str:
+    if booking.slot:
+        return slot_line(booking.slot)
+    return f"📅 {fmt_dt(booking.booking_date)} • 📍 {booking.location}"
+
+
+async def build_reschedule_dates_kb(
+    booking_id: int,
+    *,
+    actor_role: str,
+    actor_user_id: int | None,
+) -> InlineKeyboardMarkup | None:
+    async with SessionLocal() as session:
+        dates = await get_available_reschedule_dates(
+            session,
+            booking_id,
+            actor_role=actor_role,
+            actor_user_id=actor_user_id,
+            days=ADMIN_DAYS_TOTAL if actor_role == "admin" else CLIENT_DAYS_TOTAL,
+        )
+
+    if not dates:
+        return None
+
+    prefix = "adm_rs_day" if actor_role == "admin" else "rs_day"
+    cancel_cb = "adm_rs_cancel" if actor_role == "admin" else "rs_cancel"
+    rows = []
+    for d in dates:
+        label = d.strftime("%a %d.%m")
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"{prefix}:{d.isoformat()}")])
+
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=cancel_cb)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def build_reschedule_slots_kb(
+    booking_id: int,
+    target_date: date,
+    *,
+    actor_role: str,
+    actor_user_id: int | None,
+) -> InlineKeyboardMarkup | None:
+    async with SessionLocal() as session:
+        slots = await get_available_reschedule_slots(
+            session,
+            booking_id,
+            target_date,
+            actor_role=actor_role,
+            actor_user_id=actor_user_id,
+        )
+
+    if not slots:
+        return None
+
+    prefix = "adm_rs_slot" if actor_role == "admin" else "rs_slot"
+    back_cb = "adm_rs_back_days" if actor_role == "admin" else "rs_back_days"
+    cancel_cb = "adm_rs_cancel" if actor_role == "admin" else "rs_cancel"
+
+    rows = []
+    row = []
+    for slot in slots:
+        label = f"{slot.start_time.strftime('%H:%M')} • {slot.location_code}"
+        if slot.capacity > 1:
+            label = f"{label} ({slot.booked_count}/{slot.capacity})"
+        row.append(InlineKeyboardButton(text=label, callback_data=f"{prefix}:{slot.id}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(text="↩️ Назад", callback_data=back_cb)])
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data=cancel_cb)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_reschedule_confirm_kb(actor_role: str) -> InlineKeyboardMarkup:
+    confirm_cb = "adm_rs_confirm" if actor_role == "admin" else "rs_confirm"
+    back_cb = "adm_rs_back_slots" if actor_role == "admin" else "rs_back_slots"
+    cancel_cb = "adm_rs_cancel" if actor_role == "admin" else "rs_cancel"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Підтвердити перенесення", callback_data=confirm_cb)],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data=back_cb)],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data=cancel_cb)],
+    ])
 
 
 
@@ -1999,41 +2101,13 @@ async def confirm_booking(callback: types.CallbackQuery, state: FSMContext):
     async with SessionLocal() as session:
         reschedule_id = data.get("reschedule_booking_id")
         if reschedule_id:
-            q = select(Booking).options(joinedload(Booking.slot)).where(Booking.id == reschedule_id)
-            old_booking = (await session.execute(q)).scalar_one_or_none()
-            
-            if not old_booking or old_booking.status != "active":
-                await safe_answer_message(callback.message, "❌ Помилка: старий запис не знайдено або він вже неактивний.")
-                await state.clear()
-                return
-            if not old_booking.slot:
-                await safe_answer_message(callback.message, "❌ Помилка: слот старого запису відсутній.")
-                await state.clear()
-                return
-            if old_booking.slot.id == int(slot_id):
-                await safe_answer_message(callback.message, "❌ Ти обрав той самий слот. Перенесення скасовано.")
-                await state.clear()
-                return
-            if as_kyiv(old_booking.slot.start_time) <= now_kyiv() + timedelta(hours=4):
-                await safe_answer_message(callback.message, "❌ Перенести тренування можна не пізніше ніж за 4 години до початку.")
-                await state.clear()
-                return
-                
-            booking, msg = await create_booking(
+            booking, msg, old_slot, new_slot = await reschedule_booking(
                 session,
-                telegram_id=callback.from_user.id,
-                username=callback.from_user.username,
-                full_name=callback.from_user.full_name,
-                slot_id=int(slot_id),
-                people_count=int(people_count)
+                int(reschedule_id),
+                int(slot_id),
+                actor_role="user",
+                actor_user_id=callback.from_user.id,
             )
-            if booking:
-                success, c_msg = await cancel_booking(session, reschedule_id, telegram_id=callback.from_user.id)
-                if success:
-                    old_booking.attendance = "rescheduled"
-                    await session.commit()
-                else:
-                    logging.error(f"Post-reschedule cancellation failed for booking {reschedule_id}: {c_msg}")
         else:
             booking, msg = await create_booking(
                 session,
@@ -3124,13 +3198,13 @@ async def weekly_reminder_off_cmd(callback: types.CallbackQuery):
 async def reschedule_booking_cmd(callback: types.CallbackQuery, state: FSMContext):
     try:
         booking_id = int(callback.data.split(":")[1])
-        logger.info("booking_reschedule_started", extra={"telegram_id": callback.from_user.id, "booking_id": booking_id})
+        logger.info("reschedule_started", extra={"user_id": callback.from_user.id, "booking_id": booking_id, "actor_role": "user"})
     except (IndexError, ValueError):
         await safe_callback_answer(callback, "Помилка: некоректні дані", show_alert=True)
         return
 
     async with SessionLocal() as session:
-        q = select(Booking).options(joinedload(Booking.slot)).where(Booking.id == booking_id)
+        q = select(Booking).options(joinedload(Booking.slot), joinedload(Booking.user)).where(Booking.id == booking_id)
         booking = (await session.execute(q)).scalar_one_or_none()
         
         if not booking or booking.status != "active":
@@ -3150,19 +3224,162 @@ async def reschedule_booking_cmd(callback: types.CallbackQuery, state: FSMContex
             await safe_callback_answer(callback, "Перенести тренування можна не пізніше ніж за 4 години до початку.", show_alert=True)
             return
 
-    await state.set_state(BookingStates.choosing_day)
-    await state.update_data(reschedule_booking_id=booking_id)
+        old_b_str = booking_line(booking)
 
-    kb = build_client_days_kb()
-    if kb:
+    await state.set_state(RescheduleStates.choosing_day)
+    await state.update_data(reschedule_booking_id=booking_id, old_b_str=old_b_str)
+
+    kb = await build_reschedule_dates_kb(booking_id, actor_role="user", actor_user_id=callback.from_user.id)
+    if kb is not None:
         await safe_edit_text(callback.message, 
             "🔄 Перенесення тренування.\n\n"
+            f"Старий запис:\n{old_b_str}\n\n"
             "Обери новий день для запису 👇\n\n"
-            "Показані тільки дні, де є вільні місця.",
+            "Показані тільки дні, де є доступні майбутні слоти.",
             reply_markup=kb
         )
     else:
-        await safe_edit_text(callback.message, "Немає доступних днів для запису.")
+        await safe_edit_text(callback.message, "На жаль, зараз немає доступних слотів для перенесення.")
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(RescheduleStates.choosing_day, F.data.startswith("rs_day:"))
+async def reschedule_pick_day(callback: types.CallbackQuery, state: FSMContext):
+    day_iso = callback.data.split(":", 1)[1]
+    target_date = date.fromisoformat(day_iso)
+    data = await state.get_data()
+    booking_id = int(data["reschedule_booking_id"])
+
+    kb = await build_reschedule_slots_kb(
+        booking_id,
+        target_date,
+        actor_role="user",
+        actor_user_id=callback.from_user.id,
+    )
+    if kb is None:
+        await safe_edit_text(
+            callback.message,
+            "На цей день вже немає доступних слотів для перенесення.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ Назад", callback_data="rs_back_days")],
+                [InlineKeyboardButton(text="❌ Скасувати", callback_data="rs_cancel")],
+            ]),
+        )
+        await safe_callback_answer(callback)
+        return
+
+    await state.update_data(reschedule_day=day_iso)
+    await state.set_state(RescheduleStates.choosing_slot)
+    await safe_edit_text(
+        callback.message,
+        f"🔄 Перенесення запису\n\nСтарий запис:\n{data.get('old_b_str')}\n\n"
+        f"Новий день: {target_date.strftime('%d.%m.%Y')}\nОберіть новий слот:",
+        reply_markup=kb,
+    )
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(RescheduleStates.choosing_slot, F.data.startswith("rs_slot:"))
+async def reschedule_pick_slot(callback: types.CallbackQuery, state: FSMContext):
+    slot_id = int(callback.data.split(":")[1])
+    data = await state.get_data()
+
+    async with SessionLocal() as session:
+        slot = await session.get(Slot, slot_id)
+    if not slot:
+        await safe_callback_answer(callback, "Слот не знайдено", show_alert=True)
+        return
+
+    await state.update_data(reschedule_new_slot_id=slot_id, new_b_str=slot_line(slot))
+    await state.set_state(RescheduleStates.confirming)
+    await safe_edit_text(
+        callback.message,
+        "Підтвердіть перенесення:\n\n"
+        f"Старий запис:\n{data.get('old_b_str')}\n\n"
+        f"Новий запис:\n{slot_line(slot)}",
+        reply_markup=build_reschedule_confirm_kb("user"),
+    )
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(RescheduleStates.confirming, F.data == "rs_confirm")
+async def reschedule_confirm(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    booking_id = int(data["reschedule_booking_id"])
+    new_slot_id = int(data["reschedule_new_slot_id"])
+
+    async with SessionLocal() as session:
+        booking, msg, old_slot, new_slot = await reschedule_booking(
+            session,
+            booking_id,
+            new_slot_id,
+            actor_role="user",
+            actor_user_id=callback.from_user.id,
+        )
+
+    if not booking:
+        await safe_callback_answer(callback, msg, show_alert=True)
+        return
+
+    await state.clear()
+    text = (
+        "✅ Запис успішно перенесено\n\n"
+        f"Було:\n{slot_line(old_slot)}\n\n"
+        f"Стало:\n{slot_line(new_slot)}"
+    )
+    await safe_edit_text(callback.message, text)
+    await safe_callback_answer(callback, "✅ Перенесено", show_alert=True)
+
+    if ADMIN_ID and ADMIN_ID != 0:
+        await safe_send_message(
+            bot,
+            ADMIN_ID,
+            "🔄 КЛІЄНТ ПЕРЕНІС ЗАПИС\n"
+            f"👤 {callback.from_user.full_name} (@{callback.from_user.username or '—'})\n"
+            f"Booking ID: {booking_id}\n\n"
+            f"Було: {slot_line(old_slot)}\n"
+            f"Стало: {slot_line(new_slot)}",
+        )
+
+
+@dp.callback_query(F.data == "rs_back_days")
+async def reschedule_back_days(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    booking_id = data.get("reschedule_booking_id")
+    if not booking_id:
+        await state.clear()
+        await safe_callback_answer(callback)
+        return
+
+    kb = await build_reschedule_dates_kb(int(booking_id), actor_role="user", actor_user_id=callback.from_user.id)
+    await state.set_state(RescheduleStates.choosing_day)
+    await safe_edit_text(
+        callback.message,
+        f"🔄 Перенесення запису\n\nСтарий запис:\n{data.get('old_b_str')}\n\nОберіть новий день:",
+        reply_markup=kb,
+    )
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(F.data == "rs_back_slots")
+async def reschedule_back_slots(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    booking_id = int(data["reschedule_booking_id"])
+    target_date = date.fromisoformat(data["reschedule_day"])
+    kb = await build_reschedule_slots_kb(booking_id, target_date, actor_role="user", actor_user_id=callback.from_user.id)
+    await state.set_state(RescheduleStates.choosing_slot)
+    await safe_edit_text(
+        callback.message,
+        f"🔄 Перенесення запису\n\nСтарий запис:\n{data.get('old_b_str')}\n\nОберіть новий слот:",
+        reply_markup=kb,
+    )
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(F.data == "rs_cancel")
+async def reschedule_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit_text(callback.message, "❌ Перенесення скасовано.\nПоточний запис залишається активним.")
     await safe_callback_answer(callback)
 
 
@@ -3478,17 +3695,22 @@ async def adm_b_edit_view(callback: types.CallbackQuery):
     if not is_admin_user(callback.from_user): return
     b_id = int(callback.data.split(":")[1])
     async with SessionLocal() as session:
-        b = await session.get(Booking, b_id)
+        b = (await session.execute(
+            select(Booking).options(joinedload(Booking.slot), joinedload(Booking.user)).where(Booking.id == b_id)
+        )).scalar_one_or_none()
         if not b:
              await safe_callback_answer(callback, "Запис не знайдено", show_alert=True)
              return
-             
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+
+    rows = [
         [InlineKeyboardButton(text="✅ Відвідав", callback_data=f"adm_att:{b.id}:visited")],
         [InlineKeyboardButton(text="❌ Не прийшов", callback_data=f"adm_att:{b.id}:no_show")],
         [InlineKeyboardButton(text="♻️ Скинути статус", callback_data=f"adm_att:{b.id}:clear")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"adm_cli_act:{b.user_id}:0")]
-    ])
+    ]
+    if b.status == "active":
+        rows.append([InlineKeyboardButton(text="🔄 Перенести запис", callback_data=f"adm_rs_start:{b.id}")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"adm_cli_act:{b.user_id}:0")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     
     st_val = getattr(b, "attendance", None)
     if st_val == "visited": st = "✅"
@@ -3499,10 +3721,188 @@ async def adm_b_edit_view(callback: types.CallbackQuery):
     text = (f"📝 <b>Керування записом #{b.id}</b>\n\n"
             f"Статус: {st}\n"
             f"Системний статус: {b.status}\n"
+            f"Дата: {fmt_dt(b.slot.start_time) if b.slot else fmt_dt(b.booking_date)}\n"
             f"Локація: {b.location}\n"
             f"Осіб: {b.people_count}")
             
     await safe_edit_text(callback.message, text, reply_markup=kb, parse_mode="HTML")
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(F.data.startswith("adm_rs_start:"))
+async def admin_reschedule_start(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    booking_id = int(callback.data.split(":")[1])
+    logger.info("reschedule_started", extra={"user_id": callback.from_user.id, "booking_id": booking_id, "actor_role": "admin"})
+
+    async with SessionLocal() as session:
+        b = (await session.execute(
+            select(Booking).options(joinedload(Booking.slot), joinedload(Booking.user)).where(Booking.id == booking_id)
+        )).scalar_one_or_none()
+
+    if not b or b.status != "active":
+        await safe_callback_answer(callback, "Запис не знайдено або він неактивний", show_alert=True)
+        return
+    if not b.slot:
+        await safe_callback_answer(callback, "Слот старого запису не знайдено", show_alert=True)
+        return
+
+    old_b_str = booking_line(b)
+    await state.set_state(AdminRescheduleStates.choosing_day)
+    await state.update_data(admin_reschedule_booking_id=booking_id, old_b_str=old_b_str)
+
+    kb = await build_reschedule_dates_kb(booking_id, actor_role="admin", actor_user_id=callback.from_user.id)
+    if kb is None:
+        await safe_edit_text(callback.message, "Немає доступних майбутніх слотів для перенесення.")
+        await safe_callback_answer(callback)
+        return
+
+    await safe_edit_text(
+        callback.message,
+        f"🔄 Перенесення запису адміністратором\n\nСтарий запис:\n{old_b_str}\n\nОберіть новий день:",
+        reply_markup=kb,
+    )
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(AdminRescheduleStates.choosing_day, F.data.startswith("adm_rs_day:"))
+async def admin_reschedule_pick_day(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    target_date = date.fromisoformat(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    booking_id = int(data["admin_reschedule_booking_id"])
+
+    kb = await build_reschedule_slots_kb(
+        booking_id,
+        target_date,
+        actor_role="admin",
+        actor_user_id=callback.from_user.id,
+    )
+    if kb is None:
+        await safe_edit_text(
+            callback.message,
+            "На цей день немає доступних слотів для перенесення.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ Назад", callback_data="adm_rs_back_days")],
+                [InlineKeyboardButton(text="❌ Скасувати", callback_data="adm_rs_cancel")],
+            ]),
+        )
+        await safe_callback_answer(callback)
+        return
+
+    await state.update_data(admin_reschedule_day=target_date.isoformat())
+    await state.set_state(AdminRescheduleStates.choosing_slot)
+    await safe_edit_text(
+        callback.message,
+        f"🔄 Перенесення запису\n\nСтарий запис:\n{data.get('old_b_str')}\n\n"
+        f"Новий день: {target_date.strftime('%d.%m.%Y')}\nОберіть новий слот:",
+        reply_markup=kb,
+    )
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(AdminRescheduleStates.choosing_slot, F.data.startswith("adm_rs_slot:"))
+async def admin_reschedule_pick_slot(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    slot_id = int(callback.data.split(":")[1])
+    data = await state.get_data()
+
+    async with SessionLocal() as session:
+        slot = await session.get(Slot, slot_id)
+    if not slot:
+        await safe_callback_answer(callback, "Слот не знайдено", show_alert=True)
+        return
+
+    await state.update_data(admin_reschedule_new_slot_id=slot_id, new_b_str=slot_line(slot))
+    await state.set_state(AdminRescheduleStates.confirming)
+    await safe_edit_text(
+        callback.message,
+        "Підтвердіть перенесення:\n\n"
+        f"Старий запис:\n{data.get('old_b_str')}\n\n"
+        f"Новий запис:\n{slot_line(slot)}",
+        reply_markup=build_reschedule_confirm_kb("admin"),
+    )
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(AdminRescheduleStates.confirming, F.data == "adm_rs_confirm")
+async def admin_reschedule_confirm(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    data = await state.get_data()
+    booking_id = int(data["admin_reschedule_booking_id"])
+    new_slot_id = int(data["admin_reschedule_new_slot_id"])
+
+    async with SessionLocal() as session:
+        booking, msg, old_slot, new_slot = await reschedule_booking(
+            session,
+            booking_id,
+            new_slot_id,
+            actor_role="admin",
+            actor_user_id=callback.from_user.id,
+        )
+
+    if not booking:
+        await safe_callback_answer(callback, msg, show_alert=True)
+        return
+
+    await state.clear()
+    await safe_edit_text(
+        callback.message,
+        "✅ Запис успішно перенесено\n\n"
+        f"Було:\n{slot_line(old_slot)}\n\n"
+        f"Стало:\n{slot_line(new_slot)}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="↩️ До запису", callback_data=f"adm_b_edit:{booking_id}")]
+        ]),
+    )
+    await safe_callback_answer(callback, "✅ Перенесено", show_alert=True)
+
+    if booking.user:
+        await safe_send_message(
+            bot,
+            booking.user.telegram_id,
+            "✅ Ваш запис успішно перенесено\n\n"
+            f"Було:\n{slot_line(old_slot)}\n\n"
+            f"Стало:\n{slot_line(new_slot)}",
+        )
+
+
+@dp.callback_query(F.data == "adm_rs_back_days")
+async def admin_reschedule_back_days(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    data = await state.get_data()
+    booking_id = int(data["admin_reschedule_booking_id"])
+    kb = await build_reschedule_dates_kb(booking_id, actor_role="admin", actor_user_id=callback.from_user.id)
+    await state.set_state(AdminRescheduleStates.choosing_day)
+    await safe_edit_text(
+        callback.message,
+        f"🔄 Перенесення запису\n\nСтарий запис:\n{data.get('old_b_str')}\n\nОберіть новий день:",
+        reply_markup=kb,
+    )
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(F.data == "adm_rs_back_slots")
+async def admin_reschedule_back_slots(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    data = await state.get_data()
+    booking_id = int(data["admin_reschedule_booking_id"])
+    target_date = date.fromisoformat(data["admin_reschedule_day"])
+    kb = await build_reschedule_slots_kb(booking_id, target_date, actor_role="admin", actor_user_id=callback.from_user.id)
+    await state.set_state(AdminRescheduleStates.choosing_slot)
+    await safe_edit_text(
+        callback.message,
+        f"🔄 Перенесення запису\n\nСтарий запис:\n{data.get('old_b_str')}\n\nОберіть новий слот:",
+        reply_markup=kb,
+    )
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(F.data == "adm_rs_cancel")
+async def admin_reschedule_cancel(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin_user(callback.from_user): return
+    await state.clear()
+    await safe_edit_text(callback.message, "❌ Перенесення скасовано.")
     await safe_callback_answer(callback)
 
 
