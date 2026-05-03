@@ -42,7 +42,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from services.telegram_wrappers import safe_send_message, safe_answer_message, safe_edit_text, safe_edit_reply_markup, safe_callback_answer
 from database.models import Base, Location, Slot, Booking, User, SlotTemplate, RecurringBookingTemplate, WeeklyScheduleReminderLog
-from services.booking_service import create_booking, cancel_booking, get_slots_by_date, get_bookings_for_day, fix_legacy_booking_user_ids, get_or_create_user
+from services.booking_service import create_booking, cancel_booking, get_bookings_for_day, fix_legacy_booking_user_ids, get_or_create_user
 from services.reschedule_service import get_available_reschedule_dates, get_available_reschedule_slots, reschedule_booking
 from services.template_service import get_templates, create_template, delete_template, toggle_template, generate_week_slots
 from services.google_calendar import safe_create_calendar_event
@@ -967,90 +967,6 @@ def build_admin_bookings_days_kb(page: int = 0) -> InlineKeyboardMarkup:
     )
 
 
-def build_admin_date_result_kb(back_callback_data: str, close_callback_data: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="↩️ Назад до днів", callback_data=back_callback_data)],
-        [InlineKeyboardButton(text="🔙 Назад в адмін-меню", callback_data=close_callback_data)],
-    ])
-
-
-def build_admin_date_result_rows(back_callback_data: str, close_callback_data: str) -> list[list[InlineKeyboardButton]]:
-    return [
-        [InlineKeyboardButton(text="↩️ Назад до днів", callback_data=back_callback_data)],
-        [InlineKeyboardButton(text="🔙 Назад в адмін-меню", callback_data=close_callback_data)],
-    ]
-
-
-def format_admin_slot_lines(target_day: date, slots: list[Slot]) -> list[str]:
-    lines = [f"📅 {target_day.isoformat()}"]
-
-    if not slots:
-        lines.append("")
-        lines.append("На цю дату слотів немає")
-        return lines
-
-    for slot in slots:
-        lines.extend([
-            "",
-            f"📍 {slot.location_code}",
-            f"🕒 {slot.start_time.strftime('%H:%M')} - {slot.end_time.strftime('%H:%M')}",
-            f"👥 {slot.booked_count}/{slot.capacity}",
-        ])
-
-    return lines
-
-
-def format_admin_booking_lines(target_day: date, bookings: list[Booking]) -> list[str]:
-    lines = [f"📅 {target_day.isoformat()}"]
-
-    if not bookings:
-        lines.append("")
-        lines.append("Немає записів.")
-        return lines
-
-    for booking in bookings:
-        user = booking.user
-        name = "—"
-        if user:
-            name = user.full_name or user.username or f"ID:{user.telegram_id}"
-
-        location = booking.slot.location_code if booking.slot else booking.location
-        booking_time = booking.slot.start_time if booking.slot else booking.booking_date
-
-        lines.extend([
-            "",
-            f"👤 {name}",
-            f"📍 {location}",
-            f"🕒 {booking_time.strftime('%H:%M')}",
-            f"👥 {getattr(booking, 'people_count', 1)}",
-        ])
-
-    return lines
-
-
-def build_admin_bookings_result_kb(
-    bookings: list[Booking],
-    day_iso: str,
-) -> InlineKeyboardMarkup:
-    rows = []
-
-    for booking in bookings:
-        user = booking.user
-        if user:
-            name = user.full_name or user.username or f"ID:{user.telegram_id}"
-        else:
-            name = "—"
-
-        booking_time = booking.slot.start_time if booking.slot else booking.booking_date
-        rows.append([InlineKeyboardButton(
-            text=f"{booking_time.strftime('%H:%M')} • {name}",
-            callback_data=f"admin_client:{booking.id}:{day_iso}"
-        )])
-
-    rows.extend(build_admin_date_result_rows("admin_bookings_back", "admin_bookings_close"))
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 def build_admin_times_kb() -> InlineKeyboardMarkup:
     rows = []
     times = []
@@ -1180,10 +1096,6 @@ def build_admin_slots_actions_kb(
     rows.append([InlineKeyboardButton(
         text="↩️ Назад до днів",
         callback_data="admin_slots_back_days"
-    )])
-    rows.append([InlineKeyboardButton(
-        text="🔙 Назад в адмін-меню",
-        callback_data="admin_slots_close"
     )])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1552,64 +1464,11 @@ async def admin_bookings_date_page(callback: types.CallbackQuery):
     await safe_callback_answer(callback)
 
 
-@dp.callback_query(F.data.regexp(r"^admin_slots_date_\d{4}-\d{2}-\d{2}$"))
-async def admin_slots_date_selected(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await safe_callback_answer(callback)
-        return
-
-    day_iso = callback.data[len("admin_slots_date_"):]
-    target_day = date.fromisoformat(day_iso)
-    logger.info("admin_slots_date_selected", extra={"date": target_day.isoformat()})
-
-    async with SessionLocal() as session:
-        slots = await get_slots_by_date(session, target_day)
-
-    await safe_edit_text(
-        callback.message,
-        "\n".join(format_admin_slot_lines(target_day, slots)),
-        reply_markup=build_admin_date_result_kb("admin_slots_back_days", "admin_slots_close")
-    )
-    await safe_callback_answer(callback)
-
-
-@dp.callback_query(F.data.regexp(r"^admin_bookings_date_\d{4}-\d{2}-\d{2}$"))
-async def admin_bookings_date_selected(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await safe_callback_answer(callback)
-        return
-
-    day_iso = callback.data[len("admin_bookings_date_"):]
-    target_day = date.fromisoformat(day_iso)
-    logger.info("admin_bookings_date_selected", extra={"date": target_day.isoformat()})
-
-    async with SessionLocal() as session:
-        bookings = await get_bookings_for_day(session, target_day)
-
-    await safe_edit_text(
-        callback.message,
-        "\n".join(format_admin_booking_lines(target_day, bookings)),
-        reply_markup=build_admin_bookings_result_kb(bookings, day_iso)
-    )
-    await safe_callback_answer(callback)
-
-
-
-
-
-
-
-
-@dp.callback_query(F.data.startswith("admin_slots_day:"))
-async def admin_slots_show_day(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await safe_callback_answer(callback)
-        return
-
-    parts = callback.data.split(":")
-    target_day_iso = parts[1]
-    filter_mode = parts[2] if len(parts) >= 3 else "all"  # all/free/booked
-
+async def render_admin_slots_day(
+    callback: types.CallbackQuery,
+    target_day_iso: str,
+    filter_mode: str = "all",
+):
     target_day = date.fromisoformat(target_day_iso)
     start = datetime.combine(target_day, datetime.min.time())
     end = start + timedelta(days=1)
@@ -1638,13 +1497,12 @@ async def admin_slots_show_day(callback: types.CallbackQuery):
         slots = slots_all
 
     if not slots:
-        await safe_answer_message(callback.message, 
+        await safe_answer_message(callback.message,
             f"📅 {target_day.strftime('%d.%m.%Y')}  |  {filter_mode.upper()}\n"
             f"🧾 Cap: {total_capacity} | Booked: {total_booked} | Free: {total_free}\n\n"
             f"Немає слотів за фільтром.",
             reply_markup=build_admin_slots_filter_kb(target_day_iso)
         )
-        await safe_callback_answer(callback)
         return
 
     # build text
@@ -1666,16 +1524,57 @@ async def admin_slots_show_day(callback: types.CallbackQuery):
             f"({s.booked_count}/{s.capacity}) | id:{s.id}"
         )
 
-    await safe_answer_message(callback.message, 
+    await safe_answer_message(callback.message,
         "\n".join(lines),
         reply_markup=build_admin_slots_filter_kb(target_day_iso)
     )
 
-    await safe_answer_message(callback.message, 
+    await safe_answer_message(callback.message,
         "Дії зі слотами:",
         reply_markup=build_admin_slots_actions_kb(target_day_iso, slots)
     )
 
+
+@dp.callback_query(F.data.regexp(r"^admin_slots_date_\d{4}-\d{2}-\d{2}$"))
+async def admin_slots_date_selected(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await safe_callback_answer(callback)
+        return
+
+    day_iso = callback.data[len("admin_slots_date_"):]
+    logger.info("admin_slots_date_selected", extra={"date": day_iso})
+    await render_admin_slots_day(callback, day_iso, "all")
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(F.data.regexp(r"^admin_bookings_date_\d{4}-\d{2}-\d{2}$"))
+async def admin_bookings_date_selected(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await safe_callback_answer(callback)
+        return
+
+    day_iso = callback.data[len("admin_bookings_date_"):]
+    logger.info("admin_bookings_date_selected", extra={"date": day_iso})
+    await render_admin_bookings_day(callback, day_iso)
+    await safe_callback_answer(callback)
+
+
+
+
+
+
+
+
+@dp.callback_query(F.data.startswith("admin_slots_day:"))
+async def admin_slots_show_day(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await safe_callback_answer(callback)
+        return
+
+    parts = callback.data.split(":")
+    target_day_iso = parts[1]
+    filter_mode = parts[2] if len(parts) >= 3 else "all"  # all/free/booked
+    await render_admin_slots_day(callback, target_day_iso, filter_mode)
     await safe_callback_answer(callback)
 
 
@@ -2899,17 +2798,7 @@ async def admin_client_profile(callback: types.CallbackQuery):
     await safe_callback_answer(callback)
 
 
-@dp.callback_query(F.data.startswith("admin_u_bookings:"))
-async def admin_client_bookings(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await safe_callback_answer(callback)
-        return
-
-    # admin_u_bookings:{user_id}:{day_iso} (day_iso for back button)
-    parts = callback.data.split(":")
-    user_id = int(parts[1])
-    day_iso = parts[2]
-
+async def render_admin_client_bookings(callback: types.CallbackQuery, user_id: int, day_iso: str) -> bool:
     from services.booking_service import get_user_bookings_admin
 
     async with SessionLocal() as session:
@@ -2917,7 +2806,7 @@ async def admin_client_bookings(callback: types.CallbackQuery):
 
     if not bookings:
         await safe_callback_answer(callback, "У клієнта немає записів", show_alert=True)
-        return
+        return False
 
     lines = [f"📌 Записи клієнта (ID:{user_id}):"]
     rows = []
@@ -2977,6 +2866,24 @@ async def admin_client_bookings(callback: types.CallbackQuery):
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
     )
+    return True
+
+
+@dp.callback_query(F.data.startswith("admin_u_bookings:"))
+async def admin_client_bookings(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await safe_callback_answer(callback)
+        return
+
+    # admin_u_bookings:{user_id}:{day_iso} (day_iso for back button)
+    parts = callback.data.split(":")
+    user_id = int(parts[1])
+    day_iso = parts[2]
+
+    rendered = await render_admin_client_bookings(callback, user_id, day_iso)
+    if not rendered:
+        return
+
     await safe_callback_answer(callback)
 
 
@@ -2997,27 +2904,14 @@ async def admin_cancel_booking_handler(callback: types.CallbackQuery):
 
     if success:
         await safe_callback_answer(callback, "✅ Запис скасовано", show_alert=True)
-        # Refresh client bookings view
-        # We can construct a fake callback or just call the function if we refactor,
-        # but easier to just recursively call the handler logic or redirect.
-        # Let's emit a new callback event or just call the handler manually?
-        # Manually constructing data is easiest.
-        
-        callback.data = f"admin_u_bookings:{user_id}:{day_iso}"
-        await admin_client_bookings(callback)
+        await render_admin_client_bookings(callback, user_id, day_iso)
     else:
         await safe_callback_answer(callback, f"❌ Помилка: {msg}", show_alert=True)
 
 
-@dp.callback_query(F.data.startswith("admin_bookings_day:"))
-async def admin_bookings_show_day(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await safe_callback_answer(callback)
-        return
-
-    day_iso = callback.data.split(":", 1)[1]
+async def render_admin_bookings_day(callback: types.CallbackQuery, day_iso: str):
     target_day = date.fromisoformat(day_iso)
-    
+
     # Use service or direct query
     async with SessionLocal() as session:
         # Get active bookings for the day
@@ -3031,7 +2925,6 @@ async def admin_bookings_show_day(callback: types.CallbackQuery):
                 [InlineKeyboardButton(text="❌ Закрити", callback_data="admin_bookings_close")],
             ])
         )
-        await safe_callback_answer(callback)
         return
 
     lines = [f"📅 Записи на {target_day.strftime('%d.%m.%Y')}"]
@@ -3066,6 +2959,16 @@ async def admin_bookings_show_day(callback: types.CallbackQuery):
     rows.append([InlineKeyboardButton(text="❌ Закрити", callback_data="admin_bookings_close")])
 
     await safe_edit_text(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.startswith("admin_bookings_day:"))
+async def admin_bookings_show_day(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await safe_callback_answer(callback)
+        return
+
+    day_iso = callback.data.split(":", 1)[1]
+    await render_admin_bookings_day(callback, day_iso)
     await safe_callback_answer(callback)
 
 @dp.callback_query(F.data == "admin_bookings_back")
